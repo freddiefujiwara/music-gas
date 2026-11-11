@@ -10,7 +10,6 @@ const mockBlob = {
 global.PropertiesService = { getScriptProperties: vi.fn().mockReturnValue(mockProperties) };
 global.DriveApp = { getFileById: vi.fn().mockReturnValue({ getBlob: vi.fn().mockReturnValue(mockBlob) }) };
 global.Utilities = { base64Encode: vi.fn((bytes) => Buffer.from(bytes).toString('base64')) };
-global.MimeType = { PLAIN_TEXT: 'text/plain' };
 global.ContentService = {
   MimeType: { JSON: 'application/json' },
   createTextOutput: vi.fn((content) => ({
@@ -66,92 +65,133 @@ describe('doGet', () => {
   });
 });
 
-describe('response cache', () => {
-  const SOURCE_MODIFIED = 1700000000000;
-  const iter = (items) => {
+describe('track cache', () => {
+  const MODIFIED = 1700000000000;
+  const SIZE = 3;
+  const DATA = Buffer.from([1, 2, 3]).toString('base64');
+  const CACHED_DATA = Buffer.from('CACHED').toString('base64');
+
+  let cacheFiles;
+  let cacheFolder;
+  let parentFolder;
+  let mp3File;
+
+  const iterOf = (items) => {
     let i = 0;
     return { hasNext: () => i < items.length, next: () => items[i++] };
   };
-  let entries;
-  let cacheFolder;
-  let parentFolder;
-  let sourceFile;
-
-  const makeEntry = (content) => {
-    const entry = {
-      content,
-      getBlob() { return { getDataAsString: () => entry.content }; },
-      setContent: vi.fn((c) => { entry.content = c; }),
-    };
-    return entry;
+  const cacheFileOf = (name) => ({
+    getBlob: () => ({ getDataAsString: () => cacheFiles.get(name) }),
+    setContent: (content) => { cacheFiles.set(name, content); },
+  });
+  const seedCache = (track, overrides = {}) => {
+    cacheFiles.set(`${track}.json`, JSON.stringify({
+      ok: true,
+      track,
+      mime: 'audio/mpeg',
+      data: CACHED_DATA,
+      sourceModified: MODIFIED,
+      sourceSize: SIZE,
+      ...overrides,
+    }));
   };
 
   beforeEach(() => {
-    entries = new Map();
+    vi.clearAllMocks();
+    cacheFiles = new Map();
     cacheFolder = {
-      getFilesByName: vi.fn((name) => iter(entries.has(name) ? [entries.get(name)] : [])),
+      getFilesByName: vi.fn((name) => iterOf(cacheFiles.has(name) ? [cacheFileOf(name)] : [])),
       createFile: vi.fn((name, content) => {
-        const entry = makeEntry(content);
-        entries.set(name, entry);
-        return entry;
+        cacheFiles.set(name, content);
+        return cacheFileOf(name);
       }),
     };
     parentFolder = {
-      getFoldersByName: vi.fn(() => iter([cacheFolder])),
-      createFolder: vi.fn(),
+      getFoldersByName: vi.fn(() => iterOf([cacheFolder])),
+      createFolder: vi.fn(() => cacheFolder),
     };
-    sourceFile = {
-      getBlob: () => mockBlob,
-      getLastUpdated: () => new Date(SOURCE_MODIFIED),
-      getParents: () => iter([parentFolder]),
+    mp3File = {
+      getBlob: vi.fn().mockReturnValue(mockBlob),
+      getLastUpdated: vi.fn().mockReturnValue(new Date(MODIFIED)),
+      getSize: vi.fn().mockReturnValue(SIZE),
+      getParents: vi.fn(() => iterOf([parentFolder])),
     };
-    global.DriveApp.getFileById.mockReturnValue(sourceFile);
+    mockProperties.getProperty.mockImplementation((key) => {
+      if (key === Code.TRACKS_PROPERTY_KEY) {
+        return JSON.stringify({ 'a.mp3': 'file-a', 'b.mp3': 'file-b' });
+      }
+      if (key === Code.CACHE_FOLDER_PROPERTY_KEY) return 'music-cache-test';
+      return null;
+    });
+    global.DriveApp.getFileById.mockReturnValue(mp3File);
+    global.MimeType = { PLAIN_TEXT: 'text/plain' };
   });
 
-  const seedEntry = (modified, data) => {
-    const entry = makeEntry(JSON.stringify({
-      sourceModified: modified,
-      payload: { ok: true, track: 'a.mp3', mime: 'audio/mpeg', data },
-    }));
-    entries.set('a.mp3.json', entry);
-    return entry;
-  };
-
-  it('serves a fresh cache entry without encoding', () => {
-    seedEntry(SOURCE_MODIFIED, 'Q0FDSEVE');
+  it('serves a fresh cached response without converting', () => {
+    seedCache('a.mp3');
     const out = parse(Code.doGet({ parameter: { track: 'a.mp3' } }));
-    expect(out.data).toBe('Q0FDSEVE');
+    expect(out).toEqual({ ok: true, track: 'a.mp3', mime: 'audio/mpeg', data: CACHED_DATA });
     expect(global.Utilities.base64Encode).not.toHaveBeenCalled();
+    expect(mp3File.getBlob).not.toHaveBeenCalled();
   });
 
-  it('builds and stores the entry on a cache miss', () => {
+  it('converts and stores the response on a cache miss', () => {
+    const out = parse(Code.doGet({ parameter: { track: 'a.mp3' } }));
+    expect(out.data).toBe(DATA);
+    expect(global.Utilities.base64Encode).toHaveBeenCalledTimes(1);
+    const stored = JSON.parse(cacheFiles.get('a.mp3.json'));
+    expect(stored.data).toBe(DATA);
+    expect(stored.sourceModified).toBe(MODIFIED);
+    expect(stored.sourceSize).toBe(SIZE);
+  });
+
+  it('rebuilds the cache when the source file changed', () => {
+    seedCache('a.mp3', { sourceModified: MODIFIED - 1 });
+    const out = parse(Code.doGet({ parameter: { track: 'a.mp3' } }));
+    expect(out.data).toBe(DATA);
+    expect(global.Utilities.base64Encode).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(cacheFiles.get('a.mp3.json')).sourceModified).toBe(MODIFIED);
+  });
+
+  it('falls back to live conversion when reading the cache fails', () => {
+    cacheFolder.getFilesByName.mockImplementation(() => { throw new Error('cache broken'); });
     const out = parse(Code.doGet({ parameter: { track: 'a.mp3' } }));
     expect(out.ok).toBe(true);
-    expect(cacheFolder.createFile).toHaveBeenCalledWith('a.mp3.json', expect.any(String), 'text/plain');
-    const stored = JSON.parse(cacheFolder.createFile.mock.calls[0][1]);
-    expect(stored.sourceModified).toBe(SOURCE_MODIFIED);
-    expect(stored.payload.data).toBe(out.data);
+    expect(out.data).toBe(DATA);
   });
 
-  it('rebuilds a stale entry in place', () => {
-    const entry = seedEntry(SOURCE_MODIFIED - 1, 'U1RBTEU=');
-    const out = parse(Code.doGet({ parameter: { track: 'a.mp3' } }));
-    expect(out.data).not.toBe('U1RBTEU=');
-    expect(entry.setContent).toHaveBeenCalled();
-    expect(JSON.parse(entry.content).sourceModified).toBe(SOURCE_MODIFIED);
-  });
-
-  it('falls back to live encoding when the cache read fails', () => {
-    cacheFolder.getFilesByName.mockImplementation(() => { throw new Error('cache down'); });
+  it('still serves when the cache folder cannot be resolved', () => {
+    mp3File.getParents.mockImplementation(() => iterOf([]));
     const out = parse(Code.doGet({ parameter: { track: 'a.mp3' } }));
     expect(out.ok).toBe(true);
-    expect(out.data).toBe(Buffer.from([1, 2, 3]).toString('base64'));
+    expect(out.data).toBe(DATA);
   });
 
-  it('preCacheAll builds an entry for every track', () => {
-    expect(Code.preCacheAll()).toBe(2);
-    expect(cacheFolder.createFile).toHaveBeenCalledTimes(2);
-    expect(entries.has('a.mp3.json')).toBe(true);
-    expect(entries.has('b.mp3.json')).toBe(true);
+  it('preCacheMusic warms every track and skips fresh ones', () => {
+    Code.preCacheMusic();
+    expect(cacheFiles.has('a.mp3.json')).toBe(true);
+    expect(cacheFiles.has('b.mp3.json')).toBe(true);
+    expect(global.Utilities.base64Encode).toHaveBeenCalledTimes(2);
+    Code.preCacheMusic();
+    expect(global.Utilities.base64Encode).toHaveBeenCalledTimes(2);
+  });
+
+  it('looks the cache folder up by the script-property name', () => {
+    parse(Code.doGet({ parameter: { track: 'a.mp3' } }));
+    expect(parentFolder.getFoldersByName).toHaveBeenCalledWith('music-cache-test');
+  });
+
+  it('rebuilds the cache when only the size changed', () => {
+    seedCache('a.mp3', { sourceSize: SIZE + 1 });
+    const out = parse(Code.doGet({ parameter: { track: 'a.mp3' } }));
+    expect(out.data).toBe(DATA);
+    expect(global.Utilities.base64Encode).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(cacheFiles.get('a.mp3.json')).sourceSize).toBe(SIZE);
+  });
+
+  it('preCacheAll is available as an alias of preCacheMusic', () => {
+    Code.preCacheAll();
+    expect(cacheFiles.has('a.mp3.json')).toBe(true);
+    expect(cacheFiles.has('b.mp3.json')).toBe(true);
   });
 });

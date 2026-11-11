@@ -7,32 +7,40 @@
  *  attachment), and the audio is not hosted on GitHub, so this
  *  endpoint bridges the gap: given a track file name it reads the
  *  file from Drive and returns the bytes as base64 JSON, which
- *  the blog front-end decodes into a Blob for the player.
- *
- *  Encoding a multi-MB MP3 on every request is slow, so the
- *  encoded response is cached: each track's payload is stored
- *  once as a JSON file in a "music-cache" subfolder next to the
- *  MP3 itself, stamped with the MP3's last-modified time. A
- *  request serves the cached payload while the stamp matches
- *  and rebuilds it (within the same request) when the MP3 has
- *  been replaced. Any cache failure falls back to encoding
- *  live, so playback never depends on the cache working.
+ *  the blog front-end decodes into a Blob for APlayer.
  *
  *  The file name -> Drive file ID mapping lives in the script
  *  property TRACKS_JSON (an object such as
  *  {"hatogaya-urawa.mp3": "<driveFileId>", ...}), so no Drive
  *  IDs appear in this repository.
  *
+ *  Converted responses are cached on Drive: the first read of a
+ *  track stores the ready-made JSON ({ ok, track, mime, data })
+ *  plus the source file's last-updated time and size in a cache
+ *  folder next to the MP3s. Later reads serve the cached JSON
+ *  when those stamps still match, skipping the blob read and
+ *  the base64 conversion. Any cache trouble falls back to the
+ *  live conversion, so playback never depends on the cache.
+ *  The responses are far too large for CacheService (100 KB per
+ *  value), so the cache lives on Drive, like blog-gas does.
+ *
+ *  The cache folder name defaults to "music-cache" and can be
+ *  overridden with the script property MUSIC_CACHE_FOLDER_NAME.
+ *  Each Apps Script project must use its own name (staging and
+ *  production share the MP3 folder but never a cache folder).
+ *
  *  API:
  *    GET ?track=<file name>  -> { ok, track, mime, data(base64) }
  *    GET ?o=list             -> { ok, tracks: [file names] }
  *  Errors are JSON too: { ok: false, error }.
  *
- *  preCacheAll() (run from the editor) builds every cache entry
- *  up front; requests also build entries lazily on a miss.
+ *  Editor helper:
+ *    preCacheMusic() (alias: preCacheAll()) builds/refreshes
+ *    the cache for every track.
  *  ----------------------------- */
 export const TRACKS_PROPERTY_KEY = 'TRACKS_JSON';
-export const CACHE_FOLDER_NAME = 'music-cache';
+export const CACHE_FOLDER_PROPERTY_KEY = 'MUSIC_CACHE_FOLDER_NAME';
+export const DEFAULT_CACHE_FOLDER_NAME = 'music-cache';
 
 export const getTracks_ = () => {
   const raw = PropertiesService.getScriptProperties().getProperty(TRACKS_PROPERTY_KEY);
@@ -44,46 +52,13 @@ export const getTracks_ = () => {
   return null;
 };
 
-export const getCacheFolder_ = (file, create) => {
-  const parents = file.getParents();
-  if (!parents.hasNext()) return null;
-  const parent = parents.next();
-  const folders = parent.getFoldersByName(CACHE_FOLDER_NAME);
-  if (folders.hasNext()) return folders.next();
-  return create ? parent.createFolder(CACHE_FOLDER_NAME) : null;
+export const getCacheFolderName_ = () => {
+  const name = PropertiesService.getScriptProperties()
+    .getProperty(CACHE_FOLDER_PROPERTY_KEY);
+  return (name && name.trim()) || DEFAULT_CACHE_FOLDER_NAME;
 };
 
-export const readCache_ = (file, track) => {
-  try {
-    const folder = getCacheFolder_(file, false);
-    if (!folder) return null;
-    const files = folder.getFilesByName(`${track}.json`);
-    if (!files.hasNext()) return null;
-    const data = JSON.parse(files.next().getBlob().getDataAsString('UTF-8'));
-    if (!data || data.sourceModified !== file.getLastUpdated().getTime()) return null;
-    const payload = data.payload;
-    if (!payload || payload.ok !== true || typeof payload.data !== 'string') return null;
-    return payload;
-  } catch (e) {
-    return null;
-  }
-};
-
-export const writeCache_ = (file, track, payload) => {
-  try {
-    const folder = getCacheFolder_(file, true);
-    if (!folder) return;
-    const content = JSON.stringify({ sourceModified: file.getLastUpdated().getTime(), payload });
-    const files = folder.getFilesByName(`${track}.json`);
-    if (files.hasNext()) {
-      files.next().setContent(content);
-    } else {
-      folder.createFile(`${track}.json`, content, MimeType.PLAIN_TEXT);
-    }
-  } catch (e) { /* the cache is best-effort */ }
-};
-
-export const buildPayload_ = (file, track) => {
+export const convertTrack_ = (track, file) => {
   const blob = file.getBlob();
   return {
     ok: true,
@@ -91,6 +66,66 @@ export const buildPayload_ = (file, track) => {
     mime: blob.getContentType() || 'audio/mpeg',
     data: Utilities.base64Encode(blob.getBytes()),
   };
+};
+
+/**
+ * Finds (or creates) this project's cache folder next to the
+ * given MP3 file. Throws when the file has no parent folder;
+ * callers treat any failure as "cache unavailable".
+ */
+export const getCacheFolder_ = (file) => {
+  const parents = file.getParents();
+  if (!parents || !parents.hasNext()) throw new Error('mp3 has no parent folder');
+  const parent = parents.next();
+  const name = getCacheFolderName_();
+  const folders = parent.getFoldersByName(name);
+  return folders.hasNext() ? folders.next() : parent.createFolder(name);
+};
+
+export const readTrackCache_ = (folder, track, file) => {
+  try {
+    const files = folder.getFilesByName(`${track}.json`);
+    if (!files.hasNext()) return null;
+    const cached = JSON.parse(files.next().getBlob().getDataAsString());
+    if (!cached || cached.ok !== true || cached.track !== track
+      || typeof cached.data !== 'string' || !cached.data) return null;
+    if (cached.sourceModified !== file.getLastUpdated().getTime()) return null;
+    if (cached.sourceSize !== file.getSize()) return null;
+    return { ok: true, track, mime: cached.mime || 'audio/mpeg', data: cached.data };
+  } catch (e) {
+    return null;
+  }
+};
+
+export const writeTrackCache_ = (folder, track, payload, file) => {
+  try {
+    const content = JSON.stringify({
+      ...payload,
+      sourceModified: file.getLastUpdated().getTime(),
+      sourceSize: file.getSize(),
+    });
+    const files = folder.getFilesByName(`${track}.json`);
+    if (files.hasNext()) files.next().setContent(content);
+    else folder.createFile(`${track}.json`, content, MimeType.PLAIN_TEXT);
+  } catch (e) { /* cache writes are best effort */ }
+};
+
+/**
+ * Serves one track, using the Drive cache when it is fresh and
+ * falling back to the live conversion whenever it is not.
+ */
+export const serveTrack_ = (track, file) => {
+  let folder = null;
+  try {
+    folder = getCacheFolder_(file);
+  } catch (e) { /* cache unavailable: convert live below */ }
+  if (folder) {
+    const cached = readTrackCache_(folder, track, file);
+    if (cached) return cached;
+  }
+  const payload = convertTrack_(track, file);
+  if (folder) writeTrackCache_(folder, track, payload, file);
+  return payload;
 };
 
 export const doGet = (e) => {
@@ -105,29 +140,40 @@ export const doGet = (e) => {
   if (!fileId) return json_({ ok: false, error: 'unknown track' });
 
   try {
-    const file = DriveApp.getFileById(fileId);
-    const cached = readCache_(file, track);
-    if (cached) return json_(cached);
-    const payload = buildPayload_(file, track);
-    writeCache_(file, track, payload);
-    return json_(payload);
+    return json_(serveTrack_(track, DriveApp.getFileById(fileId)));
   } catch (err) {
     return json_({ ok: false, error: `failed to read track: ${err.message}` });
   }
 };
 
-export const preCacheAll = () => {
+/**
+ * Warms the cache for every configured track (run from the
+ * editor; no trigger needed). Fresh entries are kept as-is.
+ */
+export const preCacheMusic = () => {
   const tracks = getTracks_();
-  if (!tracks) throw new Error('tracks are not configured');
-  let built = 0;
-  Object.entries(tracks).forEach(([track, fileId]) => {
-    const file = DriveApp.getFileById(fileId);
-    writeCache_(file, track, buildPayload_(file, track));
-    built += 1;
+  if (!tracks) {
+    console.log('tracks are not configured');
+    return;
+  }
+  Object.keys(tracks).forEach((track) => {
+    try {
+      const file = DriveApp.getFileById(tracks[track]);
+      const folder = getCacheFolder_(file);
+      if (readTrackCache_(folder, track, file)) {
+        console.log(`Fresh: ${track}`);
+        return;
+      }
+      writeTrackCache_(folder, track, convertTrack_(track, file), file);
+      console.log(`Cached: ${track}`);
+    } catch (e) {
+      console.error(`Failed: ${track}: ${e.message}`);
+    }
   });
-  console.log(`preCacheAll: built ${built} cache entries`);
-  return built;
 };
+
+/** Alias kept from the original cache proposal (PR #3). */
+export const preCacheAll = () => preCacheMusic();
 
 export const json_ = (obj) => ContentService
   .createTextOutput(JSON.stringify(obj))
