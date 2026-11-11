@@ -175,4 +175,23 @@ describe('track cache', () => {
     Code.preCacheMusic();
     expect(global.Utilities.base64Encode).toHaveBeenCalledTimes(2);
   });
+
+  it('looks the cache folder up by the script-property name', () => {
+    parse(Code.doGet({ parameter: { track: 'a.mp3' } }));
+    expect(parentFolder.getFoldersByName).toHaveBeenCalledWith('music-cache-test');
+  });
+
+  it('rebuilds the cache when only the size changed', () => {
+    seedCache('a.mp3', { sourceSize: SIZE + 1 });
+    const out = parse(Code.doGet({ parameter: { track: 'a.mp3' } }));
+    expect(out.data).toBe(DATA);
+    expect(global.Utilities.base64Encode).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(cacheFiles.get('a.mp3.json')).sourceSize).toBe(SIZE);
+  });
+
+  it('preCacheAll is available as an alias of preCacheMusic', () => {
+    Code.preCacheAll();
+    expect(cacheFiles.has('a.mp3.json')).toBe(true);
+    expect(cacheFiles.has('b.mp3.json')).toBe(true);
+  });
 });

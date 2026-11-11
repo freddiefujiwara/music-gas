@@ -35,7 +35,8 @@
  *  Errors are JSON too: { ok: false, error }.
  *
  *  Editor helper:
- *    preCacheMusic() builds/refreshes the cache for every track.
+ *    preCacheMusic() (alias: preCacheAll()) builds/refreshes
+ *    the cache for every track.
  *  ----------------------------- */
 export const TRACKS_PROPERTY_KEY = 'TRACKS_JSON';
 export const CACHE_FOLDER_PROPERTY_KEY = 'MUSIC_CACHE_FOLDER_NAME';
@@ -170,6 +171,9 @@ export const preCacheMusic = () => {
     }
   });
 };
+
+/** Alias kept from the original cache proposal (PR #3). */
+export const preCacheAll = () => preCacheMusic();
 
 export const json_ = (obj) => ContentService
   .createTextOutput(JSON.stringify(obj))
