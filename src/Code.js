@@ -9,10 +9,16 @@
  *  file from Drive and returns the bytes as base64 JSON, which
  *  the blog front-end decodes into a Blob for APlayer.
  *
- *  The file name -> Drive file ID mapping lives in the script
- *  property TRACKS_JSON (an object such as
- *  {"hatogaya-urawa.mp3": "<driveFileId>", ...}), so no Drive
- *  IDs appear in this repository.
+ *  There is no track registry to maintain. The endpoint scans
+ *  the archive folder (the folder named "music" inside "API")
+ *  and treats every file named like a romaji slug —
+ *  "<slug>.mp3", lowercase letters, digits and hyphens — as a
+ *  published track. Adding a song is just: drop "<slug>.mp3"
+ *  into the folder and reference that file name from the blog
+ *  article's [[音楽|...]] marker. Files with any other name
+ *  (unpublished takes, lyrics text files, the index) are
+ *  ignored. The scanned name -> file ID map is cached for a
+ *  few minutes so requests do not rescan the folder every time.
  *
  *  Converted responses are cached on Drive: the first read of a
  *  track stores the ready-made JSON ({ ok, track, mime, data })
@@ -38,18 +44,76 @@
  *    preCacheMusic() (alias: preCacheAll()) builds/refreshes
  *    the cache for every track.
  *  ----------------------------- */
-export const TRACKS_PROPERTY_KEY = 'TRACKS_JSON';
+export const MUSIC_FOLDER_NAME = 'music';
+export const MUSIC_PARENT_FOLDER_NAME = 'API';
+export const TRACK_NAME_PATTERN = /^[a-z0-9]+(-[a-z0-9]+)*\.mp3$/;
+export const TRACKS_CACHE_KEY = 'tracks-map-v1';
+export const TRACKS_CACHE_TTL_SECONDS = 600;
 export const CACHE_FOLDER_PROPERTY_KEY = 'MUSIC_CACHE_FOLDER_NAME';
 export const DEFAULT_CACHE_FOLDER_NAME = 'music-cache';
 
+/**
+ * Locates the archive folder: the unique folder named "music"
+ * that sits inside a folder named "API". Returns null when
+ * there is not exactly one such folder, so a renamed or
+ * duplicated folder fails loudly instead of serving the
+ * wrong files.
+ */
+export const getMusicFolder_ = () => {
+  const matches = [];
+  const folders = DriveApp.getFoldersByName(MUSIC_FOLDER_NAME);
+  while (folders.hasNext()) {
+    const folder = folders.next();
+    const parents = folder.getParents();
+    while (parents.hasNext()) {
+      if (parents.next().getName() === MUSIC_PARENT_FOLDER_NAME) {
+        matches.push(folder);
+        break;
+      }
+    }
+  }
+  return matches.length === 1 ? matches[0] : null;
+};
+
+export const scanTracks_ = (folder) => {
+  const tracks = {};
+  const files = folder.getFiles();
+  while (files.hasNext()) {
+    const file = files.next();
+    const name = file.getName();
+    if (TRACK_NAME_PATTERN.test(name)) tracks[name] = file.getId();
+  }
+  return tracks;
+};
+
+/**
+ * Returns the { file name -> Drive file ID } map for every
+ * published track, or null when the archive folder cannot be
+ * found or holds no tracks. The map is kept in CacheService
+ * for a few minutes; any cache trouble falls back to a live
+ * scan, so playback never depends on the cache working.
+ */
 export const getTracks_ = () => {
-  const raw = PropertiesService.getScriptProperties().getProperty(TRACKS_PROPERTY_KEY);
-  if (!raw) return null;
+  let cache = null;
   try {
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
-  } catch (e) { /* fall through */ }
-  return null;
+    cache = CacheService.getScriptCache();
+    const hit = cache && cache.get(TRACKS_CACHE_KEY);
+    if (hit) {
+      const parsed = JSON.parse(hit);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        && Object.keys(parsed).length) return parsed;
+    }
+  } catch (e) { /* fall through to a live scan */ }
+
+  const folder = getMusicFolder_();
+  if (!folder) return null;
+  const tracks = scanTracks_(folder);
+  if (!Object.keys(tracks).length) return null;
+
+  try {
+    if (cache) cache.put(TRACKS_CACHE_KEY, JSON.stringify(tracks), TRACKS_CACHE_TTL_SECONDS);
+  } catch (e) { /* the map cache is best-effort */ }
+  return tracks;
 };
 
 export const getCacheFolderName_ = () => {
@@ -147,7 +211,7 @@ export const doGet = (e) => {
 };
 
 /**
- * Warms the cache for every configured track (run from the
+ * Warms the cache for every published track (run from the
  * editor; no trigger needed). Fresh entries are kept as-is.
  */
 export const preCacheMusic = () => {
