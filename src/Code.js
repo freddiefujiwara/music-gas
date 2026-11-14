@@ -39,6 +39,8 @@
  *    GET ?track=<file name>  -> { ok, track, mime, data(base64) }
  *    GET ?o=list             -> { ok, tracks: [file names] }
  *    GET ?o=rss              -> podcast RSS feed built from music-db
+ *    POST { action, ... }    -> the music-admin API (see the
+ *      admin section below; owner/share-session authenticated)
  *  Errors are JSON too: { ok: false, error }.
  *
  *  Editor helper:
@@ -57,12 +59,26 @@
  *  write target, so staging points it at a throwaway copy.
  *  ----------------------------- */
 export const MUSIC_FOLDER_NAME = 'music';
+export const MUSIC_FOLDER_NAME_PROPERTY_KEY = 'MUSIC_FOLDER_NAME';
 export const MUSIC_PARENT_FOLDER_NAME = 'API';
 export const TRACK_NAME_PATTERN = /^[a-z0-9]+(-[a-z0-9]+)*\.mp3$/;
 export const TRACKS_CACHE_KEY = 'tracks-map-v1';
 export const TRACKS_CACHE_TTL_SECONDS = 600;
 export const CACHE_FOLDER_PROPERTY_KEY = 'MUSIC_CACHE_FOLDER_NAME';
 export const DEFAULT_CACHE_FOLDER_NAME = 'music-cache';
+
+/**
+ * The name of the track folder inside "API". Defaults to
+ * "music" and can be overridden with the MUSIC_FOLDER_NAME
+ * script property, so the staging project can scan (and the
+ * admin API can upload into) its own folder instead of the
+ * production one it shares the parent folder with.
+ */
+export const getMusicFolderName_ = () => {
+  const name = PropertiesService.getScriptProperties()
+    .getProperty(MUSIC_FOLDER_NAME_PROPERTY_KEY);
+  return (name && name.trim()) || MUSIC_FOLDER_NAME;
+};
 
 /**
  * Locates the archive folder: the unique folder named "music"
@@ -73,7 +89,7 @@ export const DEFAULT_CACHE_FOLDER_NAME = 'music-cache';
  */
 export const getMusicFolder_ = () => {
   const matches = [];
-  const folders = DriveApp.getFoldersByName(MUSIC_FOLDER_NAME);
+  const folders = DriveApp.getFoldersByName(getMusicFolderName_());
   while (folders.hasNext()) {
     const folder = folders.next();
     const parents = folder.getParents();
@@ -316,11 +332,16 @@ export const cellDuration_ = (value) => {
 };
 
 /**
- * Parses the "tracks" sheet values (header row + data rows)
- * into track objects, keeping only published rows and
- * ordering them by the sort column, ascending.
+ * Shared core of the two "tracks" sheet parsers. Every track
+ * carries `row`, its data row number (the header row excluded,
+ * counting from 1), so the admin API can address the row it
+ * came from. Completely blank rows are skipped in both modes
+ * (their row numbers are still consumed, so numbering never
+ * shifts). Published mode keeps only published rows with a
+ * file and orders them by the sort column; the admin mode
+ * keeps every non-blank row in sheet order.
  */
-export const parseTracksSheet_ = (values) => {
+export const parseTracksValues_ = (values, includeUnpublished) => {
   if (!Array.isArray(values) || !values.length) {
     throw new Error('tracks sheet is empty');
   }
@@ -334,8 +355,11 @@ export const parseTracksSheet_ = (values) => {
     const i = headers.indexOf(name);
     return i >= 0 && i < row.length ? row[i] : '';
   };
-  return values.slice(1)
-    .map((row) => ({
+  const tracks = [];
+  values.slice(1).forEach((row, index) => {
+    if (!row || row.every((cell) => cellText_(cell) === '')) return;
+    const track = {
+      row: index + 1,
       file: cellText_(col(row, 'file')),
       title: cellText_(col(row, 'title')),
       description: cellText_(col(row, 'description')),
@@ -347,10 +371,27 @@ export const parseTracksSheet_ = (values) => {
       lyrics: cellText_(col(row, 'lyrics')),
       sort: cellSort_(col(row, 'sort')),
       published: cellBool_(col(row, 'published')),
-    }))
-    .filter((track) => track.published && track.file)
-    .sort((a, b) => a.sort - b.sort);
+    };
+    if (includeUnpublished || (track.published && track.file)) {
+      tracks.push(track);
+    }
+  });
+  if (!includeUnpublished) tracks.sort((a, b) => a.sort - b.sort);
+  return tracks;
 };
+
+/**
+ * Parses the "tracks" sheet values (header row + data rows)
+ * into track objects, keeping only published rows and
+ * ordering them by the sort column, ascending.
+ */
+export const parseTracksSheet_ = (values) => parseTracksValues_(values, false);
+
+/**
+ * Parses the "tracks" sheet values for the admin API: every
+ * non-blank row, published or not, in sheet order.
+ */
+export const parseTracksSheetAll_ = (values) => parseTracksValues_(values, true);
 
 /** Parses the "meta" sheet values into a { key: value } map. */
 export const parseMetaSheet_ = (values) => {
@@ -650,6 +691,798 @@ export const generateArticle = () => {
   const written = writeArticlePlan_(DocumentApp.openById(docId).getBody(), plan);
   console.log(`generateArticle: wrote ${written} paragraphs for ${tracks.length} tracks`);
   return written;
+};
+
+/** -----------------------------
+ *  Admin API (doPost) for the music-admin site.
+ *
+ *  Ported from list-of-stuff-gas so every admin surface in
+ *  this family authenticates the same way: the owner's Google
+ *  ID token, verified against the AVAILABLE_GMAILS allowlist,
+ *  is exchanged for a 30-day owner session; the owner can also
+ *  issue a temporary share link whose token is owner-equivalent.
+ *  Sessions are stored hashed in owner_sessions / share_sessions
+ *  sheets inside the music-db spreadsheet itself (created on
+ *  first use), so pointing a project at a different music-db
+ *  copy separates its sessions too.
+ *
+ *  Actions:
+ *    exchange_session / revoke_session / issue_share / revoke_share
+ *    issue_claude_key / revoke_claude_key / claude_key_status
+ *    list_tracks / create_track / update_track / delete_track
+ *    update_meta / upload_mp3 / publish_track / unpublish_track
+ *    regenerate_article / check_archive
+ *
+ *  The owner can also mint a 30-day API key for Muse (stored
+ *  hashed in the claude_keys sheet, single active key: issuing
+ *  revokes the previous one, and the plaintext is returned
+ *  exactly once, at issue time). A request body carrying a
+ *  live `claude_key` is owner-equivalent for the data actions
+ *  above, so the new-song flow can run end to end from a
+ *  script; the key never authenticates the session actions
+ *  themselves (exchange / revoke / issue / share management).
+ *  Every mutation runs under the script lock and drops the
+ *  scanned track map cache, so the public player and RSS feed
+ *  read the new state on their next request.
+ *  ----------------------------- */
+export const GOOGLE_OAUTH_CLIENT_ID_PROPERTY_KEY = 'GOOGLE_OAUTH_CLIENT_ID';
+export const AVAILABLE_GMAILS_PROPERTY_KEY = 'AVAILABLE_GMAILS';
+export const OWNER_SESSIONS_SHEET_NAME = 'owner_sessions';
+export const SHARE_SESSIONS_SHEET_NAME = 'share_sessions';
+export const CLAUDE_KEYS_SHEET_NAME = 'claude_keys';
+export const CLAUDE_KEY_PREFIX = 'mk_';
+export const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
+export const SESSION_SHEET_HEADERS = [
+  'token_hash', 'issued_at', 'expires_at', 'revoked_at',
+  'access_count', 'last_accessed_at',
+];
+
+export const getScriptProperty_ = (key) => PropertiesService
+  .getScriptProperties().getProperty(key);
+
+export const allowedEmails_ = () => (getScriptProperty_(AVAILABLE_GMAILS_PROPERTY_KEY) || '')
+  .split(',')
+  .map((v) => v.trim().toLowerCase())
+  .filter((v) => v.length > 0);
+
+/** Throws an Error when the token is missing, invalid, or not allowed. */
+export const verifyIdToken_ = (idToken) => {
+  if (!idToken) throw new Error('missing id token');
+  const clientId = getScriptProperty_(GOOGLE_OAUTH_CLIENT_ID_PROPERTY_KEY);
+  const tokenInfoUrl = `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`;
+  let res;
+  try {
+    res = UrlFetchApp.fetch(tokenInfoUrl, { muteHttpExceptions: true });
+  } catch (err) {
+    // A transport-level failure (DNS, connection) is transient;
+    // retry once before giving up. HTTP-level failures arrive as
+    // a response (muteHttpExceptions) and are not retried.
+    res = UrlFetchApp.fetch(tokenInfoUrl, { muteHttpExceptions: true });
+  }
+  if (res.getResponseCode() !== 200) throw new Error('token verification failed');
+  const payload = JSON.parse(res.getContentText());
+  if (payload.iss !== 'accounts.google.com' && payload.iss !== 'https://accounts.google.com') {
+    throw new Error('invalid iss');
+  }
+  if (payload.aud !== clientId) throw new Error('invalid aud');
+  const exp = Number(payload.exp || 0);
+  if (!exp || exp * 1000 <= Date.now()) throw new Error('token expired');
+  if (payload.email_verified !== true && payload.email_verified !== 'true') {
+    throw new Error('email not verified');
+  }
+  const email = String(payload.email || '').toLowerCase();
+  if (!email) throw new Error('missing email');
+  if (!allowedEmails_().includes(email)) throw new Error('forbidden email');
+  return email;
+};
+
+export const openMusicDb_ = () => SpreadsheetApp
+  .openById(getRequiredProperty_(MUSIC_DB_ID_PROPERTY_KEY));
+
+/**
+ * Returns one of the session sheets inside music-db, creating
+ * it (with its header row) when it does not exist yet, so no
+ * manual sheet setup is ever needed.
+ */
+export const getSessionSheet_ = (name) => {
+  const ss = openMusicDb_();
+  let sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+    sheet.appendRow(SESSION_SHEET_HEADERS);
+  }
+  return sheet;
+};
+
+export const hashSessionToken_ = (token) => Utilities
+  .computeDigest(Utilities.DigestAlgorithm.SHA_256, String(token))
+  .map((byte) => ((byte % 256) + 256) % 256)
+  .map((byte) => byte.toString(16).padStart(2, '0'))
+  .join('');
+
+export const sessionCellIso_ = (value) => {
+  if (!value) return '';
+  if (value instanceof Date) return value.toISOString();
+  return String(value);
+};
+
+export const readSessionRows_ = (name) => {
+  const sheet = getSessionSheet_(name);
+  return { sheet, values: sheet.getDataRange().getValues() };
+};
+
+export const revokeActiveSessions_ = (name, nowIso) => {
+  const { sheet, values } = readSessionRows_(name);
+  values.forEach((row, index) => {
+    if (index === 0) return;
+    const revokedAt = sessionCellIso_(row[3]);
+    const expiresAt = sessionCellIso_(row[2]);
+    if (!revokedAt && expiresAt && expiresAt > nowIso) {
+      sheet.getRange(index + 1, 4).setValue(nowIso);
+    }
+  });
+};
+
+export const issueSession_ = (name, tokenKey, { revokePrevious = true } = {}) => {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const expiresIso = new Date(now.getTime() + SESSION_TTL_SECONDS * 1000).toISOString();
+  if (revokePrevious) revokeActiveSessions_(name, nowIso);
+  const token = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
+  getSessionSheet_(name).appendRow([hashSessionToken_(token), nowIso, expiresIso, '', 0, '']);
+  return {
+    [tokenKey]: token,
+    issued_at: nowIso,
+    expires_at: expiresIso,
+    ttl_seconds: SESSION_TTL_SECONDS,
+  };
+};
+
+/** Owner sessions coexist across devices: issuing never revokes. */
+export const issueOwnerSession_ = () => issueSession_(
+  OWNER_SESSIONS_SHEET_NAME, 'session_token', { revokePrevious: false },
+);
+
+/** Share sessions are single-link: issuing revokes the old link. */
+export const issueShareSession_ = () => issueSession_(
+  SHARE_SESSIONS_SHEET_NAME, 'share_token',
+);
+
+export const revokeShareSession_ = () => {
+  revokeActiveSessions_(SHARE_SESSIONS_SHEET_NAME, new Date().toISOString());
+  return { revoked: true };
+};
+
+/**
+ * Muse API keys live in their own sheet but reuse the
+ * session row shape and the 30-day TTL. Unlike owner
+ * sessions there is exactly one live key: issuing a new
+ * one revokes the previous key, like the share link. The
+ * plaintext key is returned only by this issue call.
+ */
+export const issueClaudeKey_ = () => {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const expiresIso = new Date(now.getTime() + SESSION_TTL_SECONDS * 1000).toISOString();
+  revokeActiveSessions_(CLAUDE_KEYS_SHEET_NAME, nowIso);
+  const key = CLAUDE_KEY_PREFIX
+    + (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
+  getSessionSheet_(CLAUDE_KEYS_SHEET_NAME)
+    .appendRow([hashSessionToken_(key), nowIso, expiresIso, '', 0, '']);
+  return {
+    claude_key: key,
+    issued_at: nowIso,
+    expires_at: expiresIso,
+    ttl_seconds: SESSION_TTL_SECONDS,
+  };
+};
+
+export const revokeClaudeKey_ = () => {
+  revokeActiveSessions_(CLAUDE_KEYS_SHEET_NAME, new Date().toISOString());
+  return { revoked: true };
+};
+
+export const validateClaudeKey_ = (key) => validateSessionToken_(
+  CLAUDE_KEYS_SHEET_NAME, key,
+);
+
+/** Reports the live key's window without ever returning it. */
+export const claudeKeyStatus_ = () => {
+  const { values } = readSessionRows_(CLAUDE_KEYS_SHEET_NAME);
+  const nowIso = new Date().toISOString();
+  for (let index = 1; index < values.length; index += 1) {
+    const row = values[index];
+    if (sessionCellIso_(row[3])) continue;
+    const expiresAt = sessionCellIso_(row[2]);
+    if (!expiresAt || expiresAt <= nowIso) continue;
+    return {
+      active: true,
+      issued_at: sessionCellIso_(row[1]),
+      expires_at: expiresAt,
+    };
+  }
+  return { active: false };
+};
+
+export const validateSessionToken_ = (name, token) => {
+  if (!token) return null;
+  const hash = hashSessionToken_(token);
+  const { sheet, values } = readSessionRows_(name);
+  const nowIso = new Date().toISOString();
+  for (let index = 1; index < values.length; index += 1) {
+    const row = values[index];
+    if (row[0] !== hash) continue;
+    if (sessionCellIso_(row[3])) return null;
+    const expiresAt = sessionCellIso_(row[2]);
+    if (!expiresAt || expiresAt <= nowIso) return null;
+    sheet.getRange(index + 1, 5).setValue(Number(row[4] || 0) + 1);
+    sheet.getRange(index + 1, 6).setValue(nowIso);
+    return { expires_at: expiresAt };
+  }
+  return null;
+};
+
+export const validateOwnerToken_ = (token) => validateSessionToken_(
+  OWNER_SESSIONS_SHEET_NAME, token,
+);
+
+export const validateShareToken_ = (token) => validateSessionToken_(
+  SHARE_SESSIONS_SHEET_NAME, token,
+);
+
+export const revokeOwnerSession_ = (token) => {
+  if (token) {
+    const hash = hashSessionToken_(token);
+    const { sheet, values } = readSessionRows_(OWNER_SESSIONS_SHEET_NAME);
+    const nowIso = new Date().toISOString();
+    values.forEach((row, index) => {
+      if (index > 0 && row[0] === hash && !sessionCellIso_(row[3])) {
+        sheet.getRange(index + 1, 4).setValue(nowIso);
+      }
+    });
+  }
+  return { revoked: true };
+};
+
+/**
+ * Owner proof for owner-only actions: a valid Google ID token,
+ * or a live owner session token (the post-sign-in steady state).
+ * A share token cannot mint more share tokens.
+ */
+export const requireOwnerAuth_ = (body) => {
+  if (body.session_token && validateOwnerToken_(body.session_token)) return;
+  verifyIdToken_(body.idToken);
+};
+
+/** Serializes admin mutations so row-addressed writes cannot race. */
+export const withScriptLock_ = (fn) => {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30 * 1000);
+  try {
+    return fn();
+  } finally {
+    lock.releaseLock();
+  }
+};
+
+/** Drops the scanned track map so public reads see fresh state. */
+export const invalidateTracksCache_ = () => {
+  try {
+    const cache = CacheService.getScriptCache();
+    if (cache) cache.remove(TRACKS_CACHE_KEY);
+  } catch (e) { /* the map cache is best-effort */ }
+};
+
+/** -----------------------------
+ *  Admin writes against the tracks / meta sheets.
+ *
+ *  Columns are resolved by header name, exactly like the
+ *  readers, and a row is addressed by its data row number
+ *  (header excluded, from 1). Callers may also pass the row's
+ *  current `file` as a consistency check, so a stale screen
+ *  cannot rewrite or delete the wrong row after the sheet
+ *  changed underneath it.
+ *  ----------------------------- */
+export const TRACK_SHEET_COLUMNS = [
+  'file', 'title', 'description', 'instagram', 'suno', 'youtube',
+  'published_at', 'duration_sec', 'lyrics', 'sort', 'published',
+];
+export const META_KEYS = ['tags', 'suno_profile', 'intro', 'outro'];
+
+export const readTracksSheetAll_ = (spreadsheet) => {
+  const sheet = spreadsheet.getSheetByName(TRACKS_SHEET_NAME);
+  if (!sheet) throw new Error(`music-db has no "${TRACKS_SHEET_NAME}" sheet`);
+  const values = sheet.getDataRange().getValues();
+  return { sheet, values, tracks: parseTracksSheetAll_(values) };
+};
+
+export const resolveTrack_ = (tracks, row, file) => {
+  const n = Number(row);
+  if (!Number.isInteger(n) || n < 1) throw new Error(`invalid row: ${row}`);
+  const track = tracks.find((t) => t.row === n);
+  if (!track) throw new Error(`track row not found: ${row}`);
+  const expected = cellText_(file);
+  if (expected && track.file !== expected) {
+    throw new Error(`track file mismatch: row ${n} is ${track.file}, not ${expected}`);
+  }
+  return track;
+};
+
+/**
+ * Coerces one track payload into sheet cells in the sheet's
+ * own header order. Both the sheet's snake_case column names
+ * and the parsed camelCase fields are accepted; published_at
+ * is written as a yyyy-MM-dd string, published as a boolean,
+ * sort and duration_sec as numbers.
+ */
+export const trackRowCells_ = (track, headers) => {
+  const src = track || {};
+  const sort = Number(src.sort);
+  return headers.map((header) => {
+    switch (header) {
+      case 'published_at': return cellDate_(src.published_at ?? src.publishedAt);
+      case 'duration_sec': return cellDuration_(src.duration_sec ?? src.durationSec);
+      case 'sort': return Number.isFinite(sort) ? sort : '';
+      case 'published': return cellBool_(src.published);
+      default: return cellText_(src[header]);
+    }
+  });
+};
+
+export const createTrack_ = (spreadsheet, track) => {
+  const { sheet, values, tracks } = readTracksSheetAll_(spreadsheet);
+  const file = cellText_(track && track.file);
+  if (!TRACK_NAME_PATTERN.test(file)) {
+    throw new Error(`invalid track file name: ${file}`);
+  }
+  if (tracks.some((t) => t.file === file)) {
+    throw new Error(`track already exists: ${file}`);
+  }
+  const headers = values[0].map((h) => cellText_(h));
+  sheet.appendRow(trackRowCells_({ ...track, file }, headers));
+  return { row: values.length };
+};
+
+export const updateTrack_ = (spreadsheet, row, track, expectedFile) => {
+  const { sheet, values, tracks } = readTracksSheetAll_(spreadsheet);
+  const current = resolveTrack_(tracks, row, expectedFile);
+  if (track && track.file !== undefined && cellText_(track.file) !== current.file) {
+    throw new Error('file cannot be changed');
+  }
+  const headers = values[0].map((h) => cellText_(h));
+  const merged = { ...current, ...(track || {}), file: current.file };
+  sheet.getRange(current.row + 1, 1, 1, headers.length)
+    .setValues([trackRowCells_(merged, headers)]);
+  return { row: current.row };
+};
+
+/** Deletes the sheet row only; the Drive MP3 and IA item stay. */
+export const deleteTrack_ = (spreadsheet, row, file) => {
+  const { sheet, tracks } = readTracksSheetAll_(spreadsheet);
+  const track = resolveTrack_(tracks, row, file);
+  sheet.deleteRow(track.row + 1);
+  return { row: track.row, file: track.file };
+};
+
+export const setTrackPublished_ = (spreadsheet, row, published) => {
+  const { sheet, values, tracks } = readTracksSheetAll_(spreadsheet);
+  const track = resolveTrack_(tracks, row);
+  const headers = values[0].map((h) => cellText_(h));
+  const colIndex = headers.indexOf('published');
+  if (colIndex < 0) {
+    throw new Error('tracks sheet is missing the "published" column');
+  }
+  sheet.getRange(track.row + 1, colIndex + 1).setValue(published === true);
+  return track;
+};
+
+/** Writes the given meta keys, appending rows for new keys. */
+export const updateMeta_ = (spreadsheet, meta) => {
+  const sheet = spreadsheet.getSheetByName(META_SHEET_NAME);
+  if (!sheet) throw new Error(`music-db has no "${META_SHEET_NAME}" sheet`);
+  const values = sheet.getDataRange().getValues();
+  const updated = [];
+  META_KEYS.forEach((key) => {
+    if (!meta || !(key in meta)) return;
+    const idx = values.findIndex((r, i) => i > 0 && cellText_(r[0]) === key);
+    if (idx >= 0) sheet.getRange(idx + 1, 2).setValue(cellText_(meta[key]));
+    else sheet.appendRow([key, cellText_(meta[key])]);
+    updated.push(key);
+  });
+  return { updated };
+};
+
+/** -----------------------------
+ *  MP3 upload into the track folder.
+ *
+ *  The browser sends the file as base64 in the JSON body and
+ *  measures the duration itself (Apps Script cannot parse
+ *  MP3s), so this action only validates and stores the bytes.
+ *  An existing file of the same name is replaced: the new file
+ *  is created first, then the old one is trashed, so the
+ *  folder never holds zero or two live copies under the name
+ *  the folder scan keys on. Uploading alone never publishes:
+ *  without a published sheet row the track stays invisible.
+ *  ----------------------------- */
+export const MAX_MP3_BYTES = 10 * 1024 * 1024;
+
+export const uploadMp3_ = (fileName, dataBase64) => {
+  const name = cellText_(fileName);
+  if (!TRACK_NAME_PATTERN.test(name)) {
+    throw new Error(`invalid file name: ${fileName}`);
+  }
+  if (!dataBase64 || typeof dataBase64 !== 'string') {
+    throw new Error('missing mp3 data');
+  }
+  let bytes;
+  try {
+    bytes = Utilities.base64Decode(dataBase64);
+  } catch (e) {
+    throw new Error('invalid base64 data');
+  }
+  if (!bytes.length) throw new Error('empty mp3 data');
+  if (bytes.length > MAX_MP3_BYTES) {
+    throw new Error(`mp3 is too large: ${bytes.length} bytes (limit ${MAX_MP3_BYTES})`);
+  }
+  const folder = getMusicFolder_();
+  if (!folder) throw new Error('music folder is not configured');
+  const existing = folder.getFilesByName(name);
+  const olds = [];
+  while (existing.hasNext()) olds.push(existing.next());
+  folder.createFile(Utilities.newBlob(bytes, 'audio/mpeg', name));
+  olds.forEach((file) => file.setTrashed(true));
+  return { file_name: name, size: bytes.length, replaced: olds.length > 0 };
+};
+
+/** -----------------------------
+ *  Internet Archive upload (the ias3 S3-like API).
+ *
+ *  IA accepts a simplified auth header, Authorization:
+ *  LOW <access key>:<secret key>, instead of an AWS signature,
+ *  which is what makes this possible from UrlFetchApp. With
+ *  x-amz-auto-make-bucket one PUT creates the item and stores
+ *  the file; the item identifier follows the existing rule
+ *  "freddiefujiwara-<slug>". The key pair lives only in the
+ *  IA_ACCESS_KEY / IA_SECRET_KEY script properties. When they
+ *  are not configured the publish flow skips this step and
+ *  says so, instead of failing the whole publish.
+ *  ----------------------------- */
+export const IA_ACCESS_KEY_PROPERTY_KEY = 'IA_ACCESS_KEY';
+export const IA_SECRET_KEY_PROPERTY_KEY = 'IA_SECRET_KEY';
+export const ARCHIVE_S3_BASE_URL = 'https://s3.us.archive.org';
+export const ARCHIVE_METADATA_BASE_URL = 'https://archive.org/metadata';
+export const ARCHIVE_COLLECTION = 'opensource_audio';
+
+export const archiveIdentifier_ = (file) => `${ARCHIVE_IDENTIFIER_PREFIX}${
+  cellText_(file).replace(/\.mp3$/i, '')}`;
+
+export const archiveKeys_ = () => {
+  const access = getScriptProperty_(IA_ACCESS_KEY_PROPERTY_KEY);
+  const secret = getScriptProperty_(IA_SECRET_KEY_PROPERTY_KEY);
+  if (!access || !String(access).trim() || !secret || !String(secret).trim()) {
+    return null;
+  }
+  return { access: String(access).trim(), secret: String(secret).trim() };
+};
+
+/** The x-archive-meta-* headers for one track's item. */
+export const archiveMetaHeaders_ = (track) => {
+  const title = (track && track.title) || '';
+  return {
+    'x-archive-meta-mediatype': 'audio',
+    'x-archive-meta-collection': ARCHIVE_COLLECTION,
+    'x-archive-meta-title': encodeURIComponent(title),
+    'x-archive-meta-creator': encodeURIComponent(RSS_ITUNES_AUTHOR),
+    'x-archive-meta-description': encodeURIComponent(
+      `Sunoで作った川口の歌「${title}」です。`,
+    ),
+    'x-archive-meta-subject': encodeURIComponent('川口;Suno;music'),
+  };
+};
+
+/**
+ * Checks the public metadata API for the track's file inside
+ * its IA item. Never throws: any failure reads as "not there",
+ * which is all the admin list's badge needs.
+ */
+export const checkArchive_ = (file) => {
+  const name = cellText_(file);
+  try {
+    const res = UrlFetchApp.fetch(
+      `${ARCHIVE_METADATA_BASE_URL}/${encodeURIComponent(archiveIdentifier_(name))}`,
+      { muteHttpExceptions: true },
+    );
+    if (res.getResponseCode() !== 200) return { exists: false };
+    const files = (JSON.parse(res.getContentText()) || {}).files || [];
+    const hit = files.find((f) => f && f.name === name);
+    return hit ? { exists: true, size: Number(hit.size) || 0 } : { exists: false };
+  } catch (e) {
+    return { exists: false };
+  }
+};
+
+/**
+ * PUTs the Drive file's bytes into its IA item. Returns a
+ * step result instead of throwing: 'ok' when the file is
+ * already visible in the metadata, 'accepted' when IA took
+ * the PUT but has not published the file yet (its ingest is
+ * asynchronous), 'skipped_not_configured' without keys.
+ */
+export const uploadToArchive_ = (track, driveFile) => {
+  const keys = archiveKeys_();
+  if (!keys) return { status: 'skipped_not_configured' };
+  const identifier = archiveIdentifier_(track.file);
+  const bytes = driveFile.getBlob().getBytes();
+  let res;
+  try {
+    res = UrlFetchApp.fetch(
+      `${ARCHIVE_S3_BASE_URL}/${encodeURIComponent(identifier)}/${encodeURIComponent(track.file)}`,
+      {
+        method: 'put',
+        contentType: 'audio/mpeg',
+        payload: bytes,
+        headers: {
+          Authorization: `LOW ${keys.access}:${keys.secret}`,
+          'x-amz-auto-make-bucket': '1',
+          'x-archive-size-hint': String(bytes.length),
+          ...archiveMetaHeaders_(track),
+        },
+        muteHttpExceptions: true,
+      },
+    );
+  } catch (e) {
+    return { status: 'error', error: `archive upload failed: ${e.message}` };
+  }
+  const code = res.getResponseCode();
+  if (code < 200 || code >= 300) {
+    return { status: 'error', error: `archive upload failed: HTTP ${code}` };
+  }
+  return { status: checkArchive_(track.file).exists ? 'ok' : 'accepted' };
+};
+
+/** -----------------------------
+ *  Publish / unpublish.
+ *
+ *  Publishing is three idempotent steps run in order — flip
+ *  the sheet row to published, upload the MP3 to Internet
+ *  Archive, regenerate the article — and the result reports
+ *  each step separately. Nothing is rolled back: every step
+ *  can simply be re-run, which the admin's retry does. The
+ *  pre-checks run before anything changes: the sheet is the
+ *  source of truth for the article and the RSS feed, and the
+ *  feed drops items without a <link>, so file / title / suno
+ *  and the Drive MP3 itself are all mandatory.
+ *  ----------------------------- */
+export const publishTrack_ = (spreadsheet, row, file) => {
+  const { tracks } = readTracksSheetAll_(spreadsheet);
+  const track = resolveTrack_(tracks, row, file);
+  const missing = [];
+  if (!track.file) missing.push('file');
+  if (!track.title) missing.push('title');
+  if (!track.suno) missing.push('suno');
+  if (missing.length) {
+    throw new Error(`cannot publish: missing ${missing.join(', ')}`);
+  }
+  const scanned = getTracks_();
+  if (!scanned || !scanned[track.file]) {
+    throw new Error(`mp3 not found in the music folder: ${track.file}`);
+  }
+  const steps = {};
+  setTrackPublished_(spreadsheet, track.row, true);
+  steps.sheet = 'ok';
+  const archive = uploadToArchive_(track, DriveApp.getFileById(scanned[track.file]));
+  steps.archive = archive.status === 'error'
+    ? `error: ${archive.error}` : archive.status;
+  try {
+    generateArticle();
+    steps.article = 'ok';
+  } catch (e) {
+    steps.article = `error: ${e.message}`;
+  }
+  invalidateTracksCache_();
+  return { file: track.file, steps };
+};
+
+export const unpublishTrack_ = (spreadsheet, row, file) => {
+  const { tracks } = readTracksSheetAll_(spreadsheet);
+  const track = resolveTrack_(tracks, row, file);
+  const steps = {};
+  setTrackPublished_(spreadsheet, track.row, false);
+  steps.sheet = 'ok';
+  // The IA item is deliberately left in place (it cannot be
+  // removed reliably); only the sheet flag and the article move.
+  try {
+    generateArticle();
+    steps.article = 'ok';
+  } catch (e) {
+    steps.article = `error: ${e.message}`;
+  }
+  invalidateTracksCache_();
+  return { file: track.file, steps };
+};
+
+export const authError_ = (err) => {
+  const message = (err && err.message) || 'unauthorized';
+  return json_({
+    ok: false,
+    status: message === 'forbidden email' ? 403 : 401,
+    error: message,
+  });
+};
+
+export const doPost = (e) => {
+  let body;
+  try {
+    body = JSON.parse((e && e.postData && e.postData.contents) || '');
+  } catch (err) {
+    return json_({ ok: false, error: 'invalid JSON body' });
+  }
+
+  // Exchanging a Google ID token for a 30-day owner session is
+  // how a sign-in starts; revoking the session is how it ends.
+  if (body.action === 'exchange_session') {
+    try {
+      verifyIdToken_(body.idToken);
+    } catch (err) {
+      return authError_(err);
+    }
+    try {
+      return json_(withScriptLock_(() => ({ ok: true, ...issueOwnerSession_() })));
+    } catch (err) {
+      return json_({ ok: false, error: err.message });
+    }
+  }
+  if (body.action === 'revoke_session') {
+    try {
+      return json_(withScriptLock_(() => ({
+        ok: true, ...revokeOwnerSession_(body.session_token),
+      })));
+    } catch (err) {
+      return json_({ ok: false, error: err.message });
+    }
+  }
+
+  // Issuing and revoking access links and Muse API keys
+  // requires owner proof (the Google ID token, or the owner
+  // session from it); neither a share token nor a Muse key
+  // can mint more credentials.
+  if (body.action === 'issue_share' || body.action === 'revoke_share'
+    || body.action === 'issue_claude_key' || body.action === 'revoke_claude_key'
+    || body.action === 'claude_key_status') {
+    try {
+      requireOwnerAuth_(body);
+    } catch (err) {
+      return authError_(err);
+    }
+    try {
+      const result = withScriptLock_(() => {
+        if (body.action === 'issue_share') return issueShareSession_();
+        if (body.action === 'revoke_share') return revokeShareSession_();
+        if (body.action === 'issue_claude_key') return issueClaudeKey_();
+        if (body.action === 'revoke_claude_key') return revokeClaudeKey_();
+        return claudeKeyStatus_();
+      });
+      return json_({ ok: true, ...result });
+    } catch (err) {
+      return json_({ ok: false, error: err.message });
+    }
+  }
+
+  // The remaining actions accept the owner's ID token, the
+  // owner session exchanged from it, a share token from an
+  // issued access link (owner-equivalent), or a live Muse
+  // API key (also owner-equivalent).
+  let shareSession = null;
+  if (body.session_token) {
+    let ownerSession = null;
+    try {
+      ownerSession = validateOwnerToken_(body.session_token);
+    } catch (err) {
+      return json_({ ok: false, error: err.message });
+    }
+    if (!ownerSession) {
+      return json_({ ok: false, status: 401, error: 'session expired or invalid' });
+    }
+  } else if (body.claude_key) {
+    let claudeKey = null;
+    try {
+      claudeKey = validateClaudeKey_(body.claude_key);
+    } catch (err) {
+      return json_({ ok: false, error: err.message });
+    }
+    if (!claudeKey) {
+      return json_({ ok: false, status: 401, error: 'claude key expired or invalid' });
+    }
+  } else if (body.share_token) {
+    try {
+      shareSession = validateShareToken_(body.share_token);
+    } catch (err) {
+      return json_({ ok: false, error: err.message });
+    }
+    if (!shareSession) {
+      return json_({ ok: false, status: 401, error: 'share session expired or invalid' });
+    }
+  } else {
+    try {
+      verifyIdToken_(body.idToken);
+    } catch (err) {
+      return authError_(err);
+    }
+  }
+  const out = (payload) => (shareSession
+    ? { ...payload, _share: { expires_at: shareSession.expires_at } }
+    : payload);
+
+  try {
+    if (body.action === 'list_tracks') {
+      const spreadsheet = openMusicDb_();
+      const { tracks } = readTracksSheetAll_(spreadsheet);
+      const metaSheet = spreadsheet.getSheetByName(META_SHEET_NAME);
+      const meta = metaSheet
+        ? parseMetaSheet_(metaSheet.getDataRange().getValues())
+        : {};
+      return json_(out({ ok: true, tracks, meta }));
+    }
+    if (body.action === 'check_archive') {
+      const file = cellText_(body.file);
+      return json_(out({ ok: true, file, ...checkArchive_(file) }));
+    }
+    if (body.action === 'create_track') {
+      const result = withScriptLock_(() => {
+        const created = createTrack_(openMusicDb_(), body.track);
+        invalidateTracksCache_();
+        return created;
+      });
+      return json_(out({ ok: true, ...result }));
+    }
+    if (body.action === 'update_track') {
+      const result = withScriptLock_(() => {
+        const updated = updateTrack_(openMusicDb_(), body.row, body.track, body.file);
+        invalidateTracksCache_();
+        return updated;
+      });
+      return json_(out({ ok: true, ...result }));
+    }
+    if (body.action === 'delete_track') {
+      const result = withScriptLock_(() => {
+        const deleted = deleteTrack_(openMusicDb_(), body.row, body.file);
+        invalidateTracksCache_();
+        return deleted;
+      });
+      return json_(out({ ok: true, ...result }));
+    }
+    if (body.action === 'update_meta') {
+      const result = withScriptLock_(() => updateMeta_(openMusicDb_(), body.meta));
+      return json_(out({ ok: true, ...result }));
+    }
+    if (body.action === 'upload_mp3') {
+      const result = withScriptLock_(() => {
+        const uploaded = uploadMp3_(body.file_name, body.data_base64);
+        invalidateTracksCache_();
+        return uploaded;
+      });
+      return json_(out({ ok: true, ...result }));
+    }
+    if (body.action === 'publish_track') {
+      const result = withScriptLock_(() => publishTrack_(
+        openMusicDb_(), body.row, body.file,
+      ));
+      return json_(out({ ok: true, ...result }));
+    }
+    if (body.action === 'unpublish_track') {
+      const result = withScriptLock_(() => unpublishTrack_(
+        openMusicDb_(), body.row, body.file,
+      ));
+      return json_(out({ ok: true, ...result }));
+    }
+    if (body.action === 'regenerate_article') {
+      const paragraphs = withScriptLock_(() => generateArticle());
+      return json_(out({ ok: true, paragraphs }));
+    }
+  } catch (err) {
+    return json_({ ok: false, error: err.message });
+  }
+  return json_({ ok: false, error: 'unknown action' });
 };
 
 export const json_ = (obj) => ContentService

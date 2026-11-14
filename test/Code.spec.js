@@ -697,6 +697,7 @@ describe('manifest', () => {
     const manifest = JSON.parse(readFileSync(new URL('../appsscript.json', import.meta.url), 'utf8'));
     expect(manifest.oauthScopes).toContain('https://www.googleapis.com/auth/spreadsheets');
     expect(manifest.oauthScopes).toContain('https://www.googleapis.com/auth/documents');
+    expect(manifest.oauthScopes).toContain('https://www.googleapis.com/auth/script.external_request');
     expect(manifest.webapp.access).toBe('ANYONE_ANONYMOUS');
   });
 });
