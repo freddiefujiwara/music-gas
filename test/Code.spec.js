@@ -89,7 +89,7 @@ global.DocumentApp = {
   ParagraphHeading: { HEADING2: 'HEADING2' },
 };
 global.ContentService = {
-  MimeType: { JSON: 'application/json' },
+  MimeType: { JSON: 'application/json', XML: 'text/xml' },
   createTextOutput: vi.fn((content) => ({
     content,
     mimeType: null,
@@ -530,6 +530,165 @@ describe('article generation: generateArticle', () => {
     expect(heading.heading).toBe('HEADING2');
     const ig = body.paragraphs.find((p) => p.runs.some((r) => r.text === Code.INSTAGRAM_LINK_LABEL));
     expect(ig.runs[0].linkUrl).toBe('https://ig/a');
+  });
+});
+
+describe('podcast RSS feed', () => {
+  const track = (overrides = {}) => ({
+    file: 'hatogaya-urawa.mp3',
+    title: '鳩ヶ谷から浦和まで',
+    description: '鳩ヶ谷から浦和までを歌った曲です。',
+    instagram: 'https://ig/hatogaya-urawa',
+    suno: 'https://suno.com/song/hatogaya-urawa',
+    youtube: 'https://youtube.com/watch?v=hatogaya-urawa',
+    publishedAt: '2026-11-07',
+    durationSec: 120,
+    lyrics: '',
+    sort: 2,
+    published: true,
+    ...overrides,
+  });
+
+  it('orders episodes by publication date descending, then sort ascending', () => {
+    const xml = Code.buildRssFeed_([
+      track({ file: 'older.mp3', title: '古い曲', publishedAt: '2026-09-22', sort: 1 }),
+      track({ file: 'same-day-later.mp3', title: '同日の後', publishedAt: '2026-11-07', sort: 3 }),
+      track(),
+      track({ file: 'newest.mp3', title: '最新の曲', publishedAt: '2026-11-13', sort: 4 }),
+    ], {
+      'older.mp3': 100,
+      'same-day-later.mp3': 300,
+      'hatogaya-urawa.mp3': 200,
+      'newest.mp3': 400,
+    });
+    const titles = [...xml.matchAll(/<item>\s*<title>([^<]+)<\/title>/g)]
+      .map((match) => match[1]);
+    expect(titles).toEqual(['最新の曲', '鳩ヶ谷から浦和まで', '同日の後', '古い曲']);
+  });
+
+  it('derives the Internet Archive enclosure URL and uses the scanned size', () => {
+    const xml = Code.buildRssFeed_([track()], { 'hatogaya-urawa.mp3': 2787607 });
+    expect(xml).toContain('<enclosure url="https://archive.org/download/'
+      + 'freddiefujiwara-hatogaya-urawa/hatogaya-urawa.mp3" '
+      + 'length="2787607" type="audio/mpeg"/>');
+    expect(Code.archiveUrl_('night-walk-kawaguchi.mp3')).toBe(
+      'https://archive.org/download/freddiefujiwara-night-walk-kawaguchi/'
+      + 'night-walk-kawaguchi.mp3',
+    );
+  });
+
+  it('converts published_at to an Asia/Tokyo RFC-822 pubDate and formats duration', () => {
+    expect(Code.formatRssDate_('2026-11-07')).toBe('Sat, 07 Nov 2026 00:00:00 +0900');
+    expect(Code.formatRssDate_('2026-09-22')).toBe('Tue, 22 Sep 2026 00:00:00 +0900');
+    expect(Code.formatDuration_(120)).toBe('2:00');
+    expect(Code.formatDuration_(48)).toBe('0:48');
+    const xml = Code.buildRssFeed_([track()], { 'hatogaya-urawa.mp3': 1 });
+    expect(xml).toContain('<pubDate>Sat, 07 Nov 2026 00:00:00 +0900</pubDate>');
+    expect(xml).toContain('<itunes:duration>2:00</itunes:duration>');
+  });
+
+  it('escapes XML in channel item fields and keeps the mandatory Suno link', () => {
+    const xml = Code.buildRssFeed_([track({
+      title: 'A & B <川口>',
+      description: '説明 "quoted" & <tagged>',
+      suno: 'https://suno.example/song?a=1&b=2',
+    })], { 'hatogaya-urawa.mp3': 1 });
+    expect(xml).toContain('<title>A &amp; B &lt;川口&gt;</title>');
+    expect(xml).toContain('<description>説明 &quot;quoted&quot; &amp; &lt;tagged&gt;</description>');
+    expect(xml).toContain('<link>https://suno.example/song?a=1&amp;b=2</link>');
+    expect(Code.escapeXml_("a & <b> \"c\" 'd'"))
+      .toBe('a &amp; &lt;b&gt; &quot;c&quot; &apos;d&apos;');
+  });
+
+  it('omits unpublished tracks and tracks absent from the Drive scan', () => {
+    const xml = Code.buildRssFeed_([
+      track(),
+      track({ file: 'draft.mp3', title: '下書き', published: false }),
+      track({ file: 'missing.mp3', title: '未スキャン' }),
+    ], {
+      'hatogaya-urawa.mp3': 200,
+      'draft.mp3': 300,
+    });
+    expect(xml).toContain('<title>鳩ヶ谷から浦和まで</title>');
+    expect(xml).not.toContain('<title>下書き</title>');
+    expect(xml).not.toContain('<title>未スキャン</title>');
+    expect([...xml.matchAll(/<item>/g)]).toHaveLength(1);
+  });
+
+  it('parses duration_sec from the tracks sheet', () => {
+    const HEADER = ['file', 'title', 'description', 'instagram', 'suno', 'youtube',
+      'published_at', 'duration_sec', 'lyrics', 'sort', 'published'];
+    const values = {
+      file: 'a.mp3', title: '曲A', description: '', instagram: '', suno: 'https://suno/a',
+      youtube: '', published_at: '2026-11-07', duration_sec: '120', lyrics: '',
+      sort: 1, published: true,
+    };
+    const tracks = Code.parseTracksSheet_([
+      HEADER,
+      HEADER.map((h) => values[h]),
+    ]);
+    expect(tracks[0].durationSec).toBe(120);
+  });
+
+  describe('doGet integration', () => {
+    const HEADER = ['file', 'title', 'description', 'instagram', 'suno', 'youtube',
+      'published_at', 'duration_sec', 'lyrics', 'sort', 'published'];
+    const row = (values) => HEADER.map((h) => values[h] ?? '');
+    const makeSheet = (values) => ({
+      getDataRange: vi.fn(() => ({ getValues: () => values })),
+    });
+    const wireRss = (trackValues) => {
+      mockProperties.getProperty.mockImplementation((key) => {
+        if (key === Code.MUSIC_DB_ID_PROPERTY_KEY) return 'db-id';
+        if (key === Code.CACHE_FOLDER_PROPERTY_KEY) return 'music-cache-test';
+        return null;
+      });
+      const sheets = {
+        tracks: makeSheet(trackValues),
+        meta: makeSheet([['key', 'value']]),
+      };
+      global.SpreadsheetApp.openById.mockReturnValue({
+        getSheetByName: (name) => sheets[name] || null,
+      });
+    };
+
+    it('serves only published, scanned tracks in RSS order', () => {
+      wireRss([
+        HEADER,
+        row({ file: 'a.mp3', title: '古い曲', description: '古い説明', suno: 'https://suno/a', published_at: '2026-09-22', duration_sec: 48, sort: 8, published: 'TRUE' }),
+        row({ file: 'b.mp3', title: '新しい曲', description: '新しい説明', suno: 'https://suno/b', published_at: '2026-11-07', duration_sec: 120, sort: 2, published: 'TRUE' }),
+        row({ file: 'c.mp3', title: 'スキャンに無い曲', suno: 'https://suno/c', published_at: '2026-11-13', duration_sec: 10, sort: 1, published: 'TRUE' }),
+        row({ file: 'a.mp3', title: '非公開の曲', suno: 'https://suno/draft', published_at: '2026-11-14', duration_sec: 10, sort: 0, published: 'FALSE' }),
+      ]);
+      const output = Code.doGet({ parameter: { o: 'rss' } });
+      expect(output.mimeType).toBe('text/xml');
+      expect(global.SpreadsheetApp.openById).toHaveBeenCalledWith('db-id');
+      const titles = [...output.content.matchAll(/<item>\s*<title>([^<]+)<\/title>/g)]
+        .map((match) => match[1]);
+      expect(titles).toEqual(['新しい曲', '古い曲']);
+      expect(output.content).toContain('length="3"');
+      expect(output.content).not.toContain('スキャンに無い曲');
+      expect(output.content).not.toContain('非公開の曲');
+    });
+
+    it('returns a channel-only feed when MUSIC_DB_ID is not set', () => {
+      const output = Code.doGet({ parameter: { o: 'rss' } });
+      expect(output.mimeType).toBe('text/xml');
+      expect(output.content).toContain('<title>川口の歌</title>');
+      expect(output.content).not.toContain('<item>');
+      expect(global.SpreadsheetApp.openById).not.toHaveBeenCalled();
+    });
+
+    it('returns a channel-only feed when the spreadsheet cannot be read', () => {
+      mockProperties.getProperty.mockImplementation((key) => (
+        key === Code.MUSIC_DB_ID_PROPERTY_KEY ? 'db-id' : null));
+      global.SpreadsheetApp.openById.mockImplementation(() => {
+        throw new Error('read failed');
+      });
+      const output = Code.doGet({ parameter: { o: 'rss' } });
+      expect(output.content).toContain('<title>川口の歌</title>');
+      expect(output.content).not.toContain('<item>');
+    });
   });
 });
 
