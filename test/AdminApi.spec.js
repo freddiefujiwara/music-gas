@@ -570,7 +570,11 @@ describe('Internet Archive', () => {
     expect(put.opts.headers.Authorization).toBe('LOW access-key:secret-key');
     expect(put.opts.headers['x-amz-auto-make-bucket']).toBe('1');
     expect(put.opts.headers['x-archive-meta-collection']).toBe('opensource_audio');
-    expect(put.opts.headers['x-archive-meta-title']).toBe(encodeURIComponent('曲A'));
+    expect(put.opts.headers['x-archive-meta-title']).toBe('曲A');
+    expect(put.opts.headers['x-archive-meta-creator']).toBe('藤原史和');
+    expect(put.opts.headers['x-archive-meta-description'])
+      .toBe('Sunoで作った川口の歌「曲A」です。');
+    expect(put.opts.headers['x-archive-meta-subject']).toBe('川口;Suno;music');
   });
 
   it('uploadToArchive_ reports HTTP errors and accepted uploads', () => {

@@ -1103,18 +1103,24 @@ export const archiveKeys_ = () => {
   return { access: String(access).trim(), secret: String(secret).trim() };
 };
 
-/** The x-archive-meta-* headers for one track's item. */
+/**
+ * The x-archive-meta-* headers for one track's item. The
+ * values go in raw (UTF-8), never percent-encoded: IA stores
+ * the header values verbatim, so pre-encoding them leaves
+ * "%E3%82%92…" as the item's title (seen in production on
+ * 2026-11-15, when the five tracks published through this
+ * flow all landed with encoded titles, creators and
+ * descriptions).
+ */
 export const archiveMetaHeaders_ = (track) => {
   const title = (track && track.title) || '';
   return {
     'x-archive-meta-mediatype': 'audio',
     'x-archive-meta-collection': ARCHIVE_COLLECTION,
-    'x-archive-meta-title': encodeURIComponent(title),
-    'x-archive-meta-creator': encodeURIComponent(RSS_ITUNES_AUTHOR),
-    'x-archive-meta-description': encodeURIComponent(
-      `Sunoで作った川口の歌「${title}」です。`,
-    ),
-    'x-archive-meta-subject': encodeURIComponent('川口;Suno;music'),
+    'x-archive-meta-title': title,
+    'x-archive-meta-creator': RSS_ITUNES_AUTHOR,
+    'x-archive-meta-description': `Sunoで作った川口の歌「${title}」です。`,
+    'x-archive-meta-subject': '川口;Suno;music',
   };
 };
 
