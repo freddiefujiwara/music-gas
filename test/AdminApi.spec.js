@@ -591,7 +591,72 @@ describe('Internet Archive', () => {
       .toEqual({ status: 'accepted' });
   });
 
-  it('syncArchiveMeta_ posts a JSON patch with the raw values', () => {
+  it('syncArchiveMeta_ adds missing fields with a JSON patch of raw values', () => {
+    props.IA_ACCESS_KEY = 'access-key';
+    props.IA_SECRET_KEY = 'secret-key';
+    const calls = [];
+    fetchHandler = (url, opts) => {
+      calls.push({ url, opts });
+      if (opts && opts.method === 'post') {
+        return {
+          getResponseCode: () => 200,
+          getContentText: () => JSON.stringify({ success: true, task_id: 1 }),
+        };
+      }
+      return {
+        getResponseCode: () => 200,
+        getContentText: () => JSON.stringify({ metadata: {} }),
+      };
+    };
+    const track = { file: 'a.mp3', title: '曲A' };
+    expect(Code.syncArchiveMeta_(track)).toEqual({ status: 'ok' });
+    const post = calls.find((c) => c.opts && c.opts.method === 'post');
+    expect(post.url).toBe('https://archive.org/metadata/freddiefujiwara-a');
+    expect(post.opts.headers.Authorization).toBe('LOW access-key:secret-key');
+    const form = new URLSearchParams(post.opts.payload);
+    expect(form.get('-target')).toBe('metadata');
+    expect(JSON.parse(form.get('-patch'))).toEqual([
+      { op: 'add', path: '/title', value: '曲A' },
+      { op: 'add', path: '/creator', value: '藤原史和' },
+      { op: 'add', path: '/description', value: 'Sunoで作った川口の歌「曲A」です。' },
+      { op: 'add', path: '/subject', value: ['川口', 'Suno', 'music'] },
+    ]);
+  });
+
+  it('syncArchiveMeta_ replaces differing fields and skips ones already right', () => {
+    props.IA_ACCESS_KEY = 'access-key';
+    props.IA_SECRET_KEY = 'secret-key';
+    const calls = [];
+    fetchHandler = (url, opts) => {
+      calls.push({ url, opts });
+      if (opts && opts.method === 'post') {
+        return {
+          getResponseCode: () => 200,
+          getContentText: () => JSON.stringify({ success: true, task_id: 2 }),
+        };
+      }
+      return {
+        getResponseCode: () => 200,
+        getContentText: () => JSON.stringify({
+          metadata: {
+            title: '%E6%9B%B2A',
+            creator: '藤原史和',
+            description: 'Sunoで作った川口の歌「曲A」です。',
+            subject: ['川口', 'Suno', 'music'],
+          },
+        }),
+      };
+    };
+    const track = { file: 'a.mp3', title: '曲A' };
+    expect(Code.syncArchiveMeta_(track)).toEqual({ status: 'ok' });
+    const post = calls.find((c) => c.opts && c.opts.method === 'post');
+    const form = new URLSearchParams(post.opts.payload);
+    expect(JSON.parse(form.get('-patch'))).toEqual([
+      { op: 'replace', path: '/title', value: '曲A' },
+    ]);
+  });
+
+  it('syncArchiveMeta_ makes no request when the metadata already matches', () => {
     props.IA_ACCESS_KEY = 'access-key';
     props.IA_SECRET_KEY = 'secret-key';
     const calls = [];
@@ -599,26 +664,22 @@ describe('Internet Archive', () => {
       calls.push({ url, opts });
       return {
         getResponseCode: () => 200,
-        getContentText: () => JSON.stringify({ success: true }),
+        getContentText: () => JSON.stringify({
+          metadata: {
+            title: '曲A',
+            creator: '藤原史和',
+            description: 'Sunoで作った川口の歌「曲A」です。',
+            subject: ['川口', 'Suno', 'music'],
+          },
+        }),
       };
     };
     const track = { file: 'a.mp3', title: '曲A' };
     expect(Code.syncArchiveMeta_(track)).toEqual({ status: 'ok' });
-    expect(calls).toHaveLength(1);
-    expect(calls[0].url).toBe('https://archive.org/metadata/freddiefujiwara-a');
-    expect(calls[0].opts.method).toBe('post');
-    expect(calls[0].opts.headers.Authorization).toBe('LOW access-key:secret-key');
-    const form = new URLSearchParams(calls[0].opts.payload);
-    expect(form.get('-target')).toBe('metadata');
-    expect(JSON.parse(form.get('-patch'))).toEqual([
-      { op: 'addreplace', path: '/title', value: '曲A' },
-      { op: 'addreplace', path: '/creator', value: '藤原史和' },
-      { op: 'addreplace', path: '/description', value: 'Sunoで作った川口の歌「曲A」です。' },
-      { op: 'addreplace', path: '/subject', value: ['川口', 'Suno', 'music'] },
-    ]);
+    expect(calls.filter((c) => c.opts && c.opts.method === 'post')).toHaveLength(0);
   });
 
-  it('syncArchiveMeta_ skips without keys and reports errors', () => {
+  it('syncArchiveMeta_ skips without keys and reports the server error text', () => {
     const track = { file: 'a.mp3', title: '曲A' };
     expect(Code.syncArchiveMeta_(track)).toEqual({ status: 'skipped_not_configured' });
     props.IA_ACCESS_KEY = 'access-key';
@@ -626,12 +687,17 @@ describe('Internet Archive', () => {
     fetchHandler = () => ({ getResponseCode: () => 500, getContentText: () => '' });
     expect(Code.syncArchiveMeta_(track))
       .toEqual({ status: 'error', error: 'archive meta sync failed: HTTP 500' });
-    fetchHandler = () => ({
-      getResponseCode: () => 200,
-      getContentText: () => JSON.stringify({ error: 'bad patch' }),
-    });
+    fetchHandler = (url, opts) => (opts && opts.method === 'post'
+      ? {
+        getResponseCode: () => 400,
+        getContentText: () => JSON.stringify({ success: false, error: 'No changes made to _meta.xml' }),
+      }
+      : {
+        getResponseCode: () => 200,
+        getContentText: () => JSON.stringify({ metadata: {} }),
+      });
     expect(Code.syncArchiveMeta_(track))
-      .toEqual({ status: 'error', error: 'archive meta sync failed: bad patch' });
+      .toEqual({ status: 'error', error: 'archive meta sync failed: No changes made to _meta.xml' });
   });
 
   it('check_archive action answers through doPost', () => {
