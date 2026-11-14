@@ -405,6 +405,22 @@ describe('article generation: paragraph plan', () => {
     ]);
   });
 
+  it('adds the podcast link after the intro when podcast_feed is set', () => {
+    const meta = { ...META, podcast_feed: 'https://example.com/feed.rss' };
+    const projected = project(Code.buildArticlePlan_([trackA], meta));
+    const linkAt = projected.indexOf(
+      'link:ポッドキャストでも聴けます->https://example.com/feed.rss',
+    );
+    expect(linkAt).toBeGreaterThan(projected.indexOf('text:導入3。'));
+    expect(linkAt).toBeLessThan(projected.indexOf('text:[[音楽|曲A|a.mp3]]'));
+    expect(projected[linkAt + 1]).toBe('E');
+  });
+
+  it('omits the podcast link when podcast_feed is not set', () => {
+    const plan = Code.buildArticlePlan_([trackA], META);
+    expect(plan.some((item) => item.text === Code.PODCAST_LINK_LABEL)).toBe(false);
+  });
+
   it('omits the YouTube link when the cell is empty', () => {
     const plan = Code.buildArticlePlan_([trackB], META);
     expect(plan.some((item) => item.text === Code.YOUTUBE_LINK_LABEL)).toBe(false);
