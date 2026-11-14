@@ -276,7 +276,7 @@ export const preCacheAll = () => preCacheMusic();
  *  one row per track on the "tracks" sheet (columns are looked
  *  up by header name, so column order does not matter) and
  *  article-level key/value pairs on the "meta" sheet (tags,
- *  suno_profile, intro, outro). generateArticle() rebuilds
+ *  suno_profile, podcast_feed, intro, outro). generateArticle() rebuilds
  *  the target document from that data; the sheet -> document
  *  conversion is split into pure steps (parse the sheet
  *  values, build a paragraph plan, write the plan) so each
@@ -290,6 +290,7 @@ export const ARTICLE_REQUIRED_HEADERS = ['file', 'title', 'published', 'sort'];
 export const INSTAGRAM_LINK_LABEL = '▶️Instagramを見る';
 export const SUNO_LINK_LABEL = '▶️Suno で曲を聴く';
 export const YOUTUBE_LINK_LABEL = '▶️YouTube で動画を見る';
+export const PODCAST_LINK_LABEL = 'ポッドキャストでも聴けます';
 
 /**
  * Reads a script property that must be configured, failing
@@ -455,6 +456,12 @@ export const buildArticlePlan_ = (tracks, meta) => {
   });
   if (profile && introBlocks.length < 2) {
     link(profile, profile);
+    empty();
+  }
+
+  const podcastFeed = cellText_(meta.podcast_feed);
+  if (podcastFeed) {
+    link(PODCAST_LINK_LABEL, podcastFeed);
     empty();
   }
 
@@ -925,7 +932,7 @@ export const TRACK_SHEET_COLUMNS = [
   'file', 'title', 'description', 'instagram', 'suno', 'youtube',
   'published_at', 'duration_sec', 'lyrics', 'sort', 'published',
 ];
-export const META_KEYS = ['tags', 'suno_profile', 'intro', 'outro'];
+export const META_KEYS = ['tags', 'suno_profile', 'podcast_feed', 'intro', 'outro'];
 
 export const readTracksSheetAll_ = (spreadsheet) => {
   const sheet = spreadsheet.getSheetByName(TRACKS_SHEET_NAME);
