@@ -536,7 +536,7 @@ describe('article generation: generateArticle', () => {
 describe('manifest', () => {
   it('grants the spreadsheet/document scopes and keeps anonymous web app access', () => {
     const manifest = JSON.parse(readFileSync(new URL('../appsscript.json', import.meta.url), 'utf8'));
-    expect(manifest.oauthScopes).toContain('https://www.googleapis.com/auth/spreadsheets.readonly');
+    expect(manifest.oauthScopes).toContain('https://www.googleapis.com/auth/spreadsheets');
     expect(manifest.oauthScopes).toContain('https://www.googleapis.com/auth/documents');
     expect(manifest.webapp.access).toBe('ANYONE_ANONYMOUS');
   });
