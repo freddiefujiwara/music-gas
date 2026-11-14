@@ -43,6 +43,17 @@
  *  Editor helper:
  *    preCacheMusic() (alias: preCacheAll()) builds/refreshes
  *    the cache for every track.
+ *
+ *  The roundup article itself is generated from the music-db
+ *  spreadsheet (the single source of truth for track metadata):
+ *  generateArticle() reads the "tracks" and "meta" sheets of
+ *  the spreadsheet named by the MUSIC_DB_ID script property
+ *  and rewrites the document named by the ARTICLE_DOC_ID
+ *  script property in the same layout as the hand-maintained
+ *  article (tag line, markers + table of contents at the top,
+ *  then one section per published track). Nothing else is
+ *  written: the document given by ARTICLE_DOC_ID is the only
+ *  write target, so staging points it at a throwaway copy.
  *  ----------------------------- */
 export const MUSIC_FOLDER_NAME = 'music';
 export const MUSIC_PARENT_FOLDER_NAME = 'API';
@@ -238,6 +249,249 @@ export const preCacheMusic = () => {
 
 /** Alias kept from the original cache proposal (PR #3). */
 export const preCacheAll = () => preCacheMusic();
+
+/** -----------------------------
+ *  Article generation from the music-db spreadsheet.
+ *
+ *  The spreadsheet is the master data for the roundup article:
+ *  one row per track on the "tracks" sheet (columns are looked
+ *  up by header name, so column order does not matter) and
+ *  article-level key/value pairs on the "meta" sheet (tags,
+ *  suno_profile, intro, outro). generateArticle() rebuilds
+ *  the target document from that data; the sheet -> document
+ *  conversion is split into pure steps (parse the sheet
+ *  values, build a paragraph plan, write the plan) so each
+ *  step can be unit-tested without Google services.
+ *  ----------------------------- */
+export const MUSIC_DB_ID_PROPERTY_KEY = 'MUSIC_DB_ID';
+export const ARTICLE_DOC_ID_PROPERTY_KEY = 'ARTICLE_DOC_ID';
+export const TRACKS_SHEET_NAME = 'tracks';
+export const META_SHEET_NAME = 'meta';
+export const ARTICLE_REQUIRED_HEADERS = ['file', 'title', 'published', 'sort'];
+export const INSTAGRAM_LINK_LABEL = '▶️Instagramを見る';
+export const SUNO_LINK_LABEL = '▶️Suno で曲を聴く';
+export const YOUTUBE_LINK_LABEL = '▶️YouTube で動画を見る';
+
+/**
+ * Reads a script property that must be configured, failing
+ * loudly (before anything is opened or written) when it is
+ * missing or blank.
+ */
+export const getRequiredProperty_ = (key) => {
+  const value = PropertiesService.getScriptProperties().getProperty(key);
+  if (!value || !String(value).trim()) {
+    throw new Error(`script property ${key} is not set`);
+  }
+  return String(value).trim();
+};
+
+export const cellText_ = (value) => (value == null ? '' : String(value).trim());
+
+/**
+ * Normalizes a published_at cell to "yyyy-MM-dd". Cells come
+ * back from the sheet either as strings (kept as-is) or as
+ * Date objects (formatted in the project's time zone).
+ */
+export const cellDate_ = (value) => {
+  if (value instanceof Date) return Utilities.formatDate(value, 'Asia/Tokyo', 'yyyy-MM-dd');
+  return cellText_(value).slice(0, 10);
+};
+
+export const cellBool_ = (value) => value === true
+  || cellText_(value).toUpperCase() === 'TRUE';
+
+/** Sort keys that do not parse sort last instead of crashing. */
+export const cellSort_ = (value) => {
+  const n = typeof value === 'number' ? value : Number(cellText_(value));
+  return Number.isFinite(n) ? n : Number.MAX_SAFE_INTEGER;
+};
+
+/**
+ * Parses the "tracks" sheet values (header row + data rows)
+ * into track objects, keeping only published rows and
+ * ordering them by the sort column, ascending.
+ */
+export const parseTracksSheet_ = (values) => {
+  if (!Array.isArray(values) || !values.length) {
+    throw new Error('tracks sheet is empty');
+  }
+  const headers = values[0].map((h) => cellText_(h));
+  ARTICLE_REQUIRED_HEADERS.forEach((h) => {
+    if (!headers.includes(h)) {
+      throw new Error(`tracks sheet is missing the "${h}" column`);
+    }
+  });
+  const col = (row, name) => {
+    const i = headers.indexOf(name);
+    return i >= 0 && i < row.length ? row[i] : '';
+  };
+  return values.slice(1)
+    .map((row) => ({
+      file: cellText_(col(row, 'file')),
+      title: cellText_(col(row, 'title')),
+      description: cellText_(col(row, 'description')),
+      instagram: cellText_(col(row, 'instagram')),
+      suno: cellText_(col(row, 'suno')),
+      youtube: cellText_(col(row, 'youtube')),
+      publishedAt: cellDate_(col(row, 'published_at')),
+      lyrics: cellText_(col(row, 'lyrics')),
+      sort: cellSort_(col(row, 'sort')),
+      published: cellBool_(col(row, 'published')),
+    }))
+    .filter((track) => track.published && track.file)
+    .sort((a, b) => a.sort - b.sort);
+};
+
+/** Parses the "meta" sheet values into a { key: value } map. */
+export const parseMetaSheet_ = (values) => {
+  const meta = {};
+  if (!Array.isArray(values)) return meta;
+  values.slice(1).forEach((row) => {
+    const key = cellText_(row && row[0]);
+    if (key) meta[key] = row.length > 1 ? cellText_(row[1]) : '';
+  });
+  return meta;
+};
+
+/**
+ * Splits a multi-paragraph cell into blocks on blank lines.
+ * A block may still hold single newlines; those become
+ * separate paragraphs when the plan is built.
+ */
+export const splitBlocks_ = (text) => String(text || '')
+  .split(/\n[ \t]*\n/)
+  .map((block) => block.trim())
+  .filter((block) => block);
+
+/**
+ * Builds the paragraph plan for the article: an array of
+ * { kind: 'text' | 'heading' | 'link' | 'empty', text?, url? }
+ * in document order, mirroring the hand-maintained article:
+ *
+ *   [[タグ：…]] / intro blocks with the Suno profile link-card
+ *   paragraph after the second block / one [[音楽|title|file]]
+ *   marker per track / [[目次]] / per track: "date title"
+ *   heading, description blocks, label links, [[歌詞]] and the
+ *   lyric lines / outro paragraphs.
+ *
+ *  Section headings use the track title as-is (the title is
+ *  canonical; older hand-written heading variants are not
+ *  reproduced).
+ */
+export const buildArticlePlan_ = (tracks, meta) => {
+  const plan = [];
+  const text = (t) => plan.push({ kind: 'text', text: t });
+  const empty = () => plan.push({ kind: 'empty' });
+  const link = (label, url) => plan.push({ kind: 'link', text: label, url });
+  const blockLines = (block) => {
+    block.split('\n').forEach((line) => {
+      if (line.trim()) text(line.trim());
+    });
+  };
+
+  text(`[[タグ：${cellText_(meta.tags)}]]`);
+  empty();
+
+  const profile = cellText_(meta.suno_profile);
+  const introBlocks = splitBlocks_(meta.intro);
+  introBlocks.forEach((block, i) => {
+    blockLines(block);
+    empty();
+    if (profile && i === 1) {
+      link(profile, profile);
+      empty();
+    }
+  });
+  if (profile && introBlocks.length < 2) {
+    link(profile, profile);
+    empty();
+  }
+
+  tracks.forEach((track) => text(`[[音楽|${track.title}|${track.file}]]`));
+  text('[[目次]]');
+
+  tracks.forEach((track) => {
+    plan.push({ kind: 'heading', text: `${track.publishedAt} ${track.title}` });
+    splitBlocks_(track.description).forEach((block) => {
+      blockLines(block);
+      empty();
+    });
+    if (track.instagram) link(INSTAGRAM_LINK_LABEL, track.instagram);
+    if (track.suno) link(SUNO_LINK_LABEL, track.suno);
+    if (track.youtube) link(YOUTUBE_LINK_LABEL, track.youtube);
+    empty();
+    empty();
+    const lyrics = String(track.lyrics || '').replace(/\s+$/, '');
+    if (lyrics) {
+      text('[[歌詞]]');
+      lyrics.split('\n').forEach((line) => {
+        if (line.trim()) text(line);
+        else empty();
+      });
+    }
+  });
+
+  const outroBlocks = splitBlocks_(meta.outro);
+  outroBlocks.forEach((block, i) => {
+    blockLines(block);
+    if (i < outroBlocks.length - 1) empty();
+  });
+
+  return plan;
+};
+
+/**
+ * Rewrites the document body from a paragraph plan. The body
+ * is cleared first (clear() leaves one empty paragraph, which
+ * the first plan item reuses), then every plan item becomes
+ * one paragraph. This is the only place generateArticle()
+ * writes anything.
+ */
+export const writeArticlePlan_ = (body, plan) => {
+  body.clear();
+  const existing = body.getParagraphs();
+  const first = existing && existing.length ? existing[0] : null;
+  plan.forEach((item, index) => {
+    const paragraph = index === 0 && first ? first : body.appendParagraph('');
+    if (item.kind === 'heading') {
+      paragraph.setHeading(DocumentApp.ParagraphHeading.HEADING2);
+    }
+    if (item.text) {
+      const run = paragraph.appendText(item.text);
+      if (item.kind === 'link' && item.url) run.setLinkUrl(item.url);
+    }
+  });
+  return plan.length;
+};
+
+export const readMusicDb_ = (spreadsheet) => {
+  const tracksSheet = spreadsheet.getSheetByName(TRACKS_SHEET_NAME);
+  if (!tracksSheet) throw new Error(`music-db has no "${TRACKS_SHEET_NAME}" sheet`);
+  const metaSheet = spreadsheet.getSheetByName(META_SHEET_NAME);
+  if (!metaSheet) throw new Error(`music-db has no "${META_SHEET_NAME}" sheet`);
+  return {
+    tracks: parseTracksSheet_(tracksSheet.getDataRange().getValues()),
+    meta: parseMetaSheet_(metaSheet.getDataRange().getValues()),
+  };
+};
+
+/**
+ * Regenerates the roundup article document from music-db
+ * (run from the editor; no trigger needed). Only the document
+ * named by the ARTICLE_DOC_ID script property is written.
+ * Refuses to run with no published tracks, so a broken sheet
+ * can never blank the article.
+ */
+export const generateArticle = () => {
+  const dbId = getRequiredProperty_(MUSIC_DB_ID_PROPERTY_KEY);
+  const docId = getRequiredProperty_(ARTICLE_DOC_ID_PROPERTY_KEY);
+  const { tracks, meta } = readMusicDb_(SpreadsheetApp.openById(dbId));
+  if (!tracks.length) throw new Error('no published tracks found in music-db');
+  const plan = buildArticlePlan_(tracks, meta);
+  const written = writeArticlePlan_(DocumentApp.openById(docId).getBody(), plan);
+  console.log(`generateArticle: wrote ${written} paragraphs for ${tracks.length} tracks`);
+  return written;
+};
 
 export const json_ = (obj) => ContentService
   .createTextOutput(JSON.stringify(obj))

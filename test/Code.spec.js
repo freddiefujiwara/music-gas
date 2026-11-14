@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { readFileSync } from 'node:fs';
 import * as Code from '../src/Code.js';
 
 const mockProperties = { getProperty: vi.fn() };
@@ -78,7 +79,15 @@ global.CacheService = {
     put: (key, value) => { scriptCacheStore.set(key, value); },
   })),
 };
-global.Utilities = { base64Encode: vi.fn((bytes) => Buffer.from(bytes).toString('base64')) };
+global.Utilities = {
+  base64Encode: vi.fn((bytes) => Buffer.from(bytes).toString('base64')),
+  formatDate: vi.fn((date) => date.toISOString().slice(0, 10)),
+};
+global.SpreadsheetApp = { openById: vi.fn() };
+global.DocumentApp = {
+  openById: vi.fn(),
+  ParagraphHeading: { HEADING2: 'HEADING2' },
+};
 global.ContentService = {
   MimeType: { JSON: 'application/json' },
   createTextOutput: vi.fn((content) => ({
@@ -259,5 +268,276 @@ describe('track cache', () => {
     Code.preCacheAll();
     expect(world.cacheFiles.has('a.mp3.json')).toBe(true);
     expect(world.cacheFiles.has('b.mp3.json')).toBe(true);
+  });
+});
+
+describe('article generation: sheet parsing', () => {
+  const HEADER = ['file', 'title', 'description', 'instagram', 'suno', 'youtube',
+    'published_at', 'duration_sec', 'lyrics', 'sort', 'published'];
+  const row = (overrides = {}) => {
+    const base = {
+      file: 'a.mp3', title: '曲A', description: '説明。', instagram: 'https://ig/a',
+      suno: 'https://suno/a', youtube: 'https://yt/a', published_at: '2026-11-13',
+      duration_sec: 100, lyrics: '歌詞。', sort: 1, published: 'TRUE',
+    };
+    const merged = { ...base, ...overrides };
+    return HEADER.map((h) => merged[h]);
+  };
+
+  it('keeps only published rows and orders them by the sort column', () => {
+    const tracks = Code.parseTracksSheet_([
+      HEADER,
+      row({ file: 'b.mp3', title: '曲B', sort: 2 }),
+      row({ file: 'c.mp3', title: '曲C', sort: 3, published: 'FALSE' }),
+      row({ file: 'a.mp3', title: '曲A', sort: 1 }),
+    ]);
+    expect(tracks.map((t) => t.file)).toEqual(['a.mp3', 'b.mp3']);
+    expect(tracks[0]).toMatchObject({
+      title: '曲A', publishedAt: '2026-11-13', youtube: 'https://yt/a', published: true,
+    });
+  });
+
+  it('looks columns up by header name, not by position', () => {
+    const shuffled = ['published', 'sort', 'title', 'file', 'lyrics', 'youtube',
+      'suno', 'instagram', 'description', 'published_at', 'duration_sec'];
+    const values = { file: 'x.mp3', title: '曲X', sort: '5', published: true, published_at: '2026-09-22' };
+    const tracks = Code.parseTracksSheet_([shuffled, shuffled.map((h) => values[h] ?? '')]);
+    expect(tracks).toHaveLength(1);
+    expect(tracks[0]).toMatchObject({ file: 'x.mp3', title: '曲X', sort: 5, publishedAt: '2026-09-22' });
+  });
+
+  it('accepts boolean and string TRUE, rejects other published values', () => {
+    const tracks = Code.parseTracksSheet_([
+      HEADER,
+      row({ file: 'a.mp3', published: true }),
+      row({ file: 'b.mp3', published: 'true', sort: 2 }),
+      row({ file: 'c.mp3', published: 'yes', sort: 3 }),
+      row({ file: 'd.mp3', published: '', sort: 4 }),
+    ]);
+    expect(tracks.map((t) => t.file)).toEqual(['a.mp3', 'b.mp3']);
+  });
+
+  it('formats Date published_at cells as yyyy-MM-dd', () => {
+    const tracks = Code.parseTracksSheet_([
+      HEADER,
+      row({ published_at: new Date('2026-11-13T00:00:00.000Z') }),
+    ]);
+    expect(tracks[0].publishedAt).toBe('2026-11-13');
+  });
+
+  it('throws when a required column is missing', () => {
+    const noPublished = HEADER.filter((h) => h !== 'published');
+    expect(() => Code.parseTracksSheet_([noPublished, noPublished.map(() => '')]))
+      .toThrow('tracks sheet is missing the "published" column');
+  });
+
+  it('parses the meta sheet into a key/value map', () => {
+    const meta = Code.parseMetaSheet_([
+      ['key', 'value'],
+      ['tags', '音楽、川口'],
+      ['', 'ignored'],
+      ['intro', '導入文。'],
+      ['outro'],
+    ]);
+    expect(meta).toEqual({ tags: '音楽、川口', intro: '導入文。', outro: '' });
+  });
+});
+
+describe('article generation: paragraph plan', () => {
+  const META = {
+    tags: '音楽、川口',
+    suno_profile: 'https://suno.com/@freddiefujiwara',
+    intro: '導入1。\n\n導入2。\n\n導入3。',
+    outro: '締めの一文。',
+  };
+  const trackA = {
+    file: 'a.mp3', title: '曲A', description: '説明A。', instagram: 'https://ig/a',
+    suno: 'https://suno/a', youtube: 'https://yt/a', publishedAt: '2026-11-13',
+    lyrics: '', sort: 1, published: true,
+  };
+  const trackB = {
+    file: 'b.mp3', title: '曲B', description: '説明B1。\n\n説明B2。', instagram: 'https://ig/b',
+    suno: 'https://suno/b', youtube: '', publishedAt: '2026-11-07',
+    lyrics: '歌詞B1行目\n歌詞B2行目\n\n歌詞B3行目', sort: 2, published: true,
+  };
+  const project = (plan) => plan.map((item) => (item.kind === 'empty'
+    ? 'E'
+    : `${item.kind}:${item.text}${item.url ? `->${item.url}` : ''}`));
+
+  it('lays out tags, intro, markers, table of contents, sections, outro in order', () => {
+    expect(project(Code.buildArticlePlan_([trackA, trackB], META))).toEqual([
+      'text:[[タグ：音楽、川口]]',
+      'E',
+      'text:導入1。',
+      'E',
+      'text:導入2。',
+      'E',
+      'link:https://suno.com/@freddiefujiwara->https://suno.com/@freddiefujiwara',
+      'E',
+      'text:導入3。',
+      'E',
+      'text:[[音楽|曲A|a.mp3]]',
+      'text:[[音楽|曲B|b.mp3]]',
+      'text:[[目次]]',
+      'heading:2026-11-13 曲A',
+      'text:説明A。',
+      'E',
+      'link:▶️Instagramを見る->https://ig/a',
+      'link:▶️Suno で曲を聴く->https://suno/a',
+      'link:▶️YouTube で動画を見る->https://yt/a',
+      'E',
+      'E',
+      'heading:2026-11-07 曲B',
+      'text:説明B1。',
+      'E',
+      'text:説明B2。',
+      'E',
+      'link:▶️Instagramを見る->https://ig/b',
+      'link:▶️Suno で曲を聴く->https://suno/b',
+      'E',
+      'E',
+      'text:[[歌詞]]',
+      'text:歌詞B1行目',
+      'text:歌詞B2行目',
+      'E',
+      'text:歌詞B3行目',
+      'text:締めの一文。',
+    ]);
+  });
+
+  it('omits the YouTube link when the cell is empty', () => {
+    const plan = Code.buildArticlePlan_([trackB], META);
+    expect(plan.some((item) => item.text === Code.YOUTUBE_LINK_LABEL)).toBe(false);
+    expect(plan.some((item) => item.text === Code.INSTAGRAM_LINK_LABEL)).toBe(true);
+  });
+
+  it('omits the lyrics block entirely when a track has no lyrics', () => {
+    const plan = Code.buildArticlePlan_([trackA], META);
+    expect(plan.some((item) => item.text === '[[歌詞]]')).toBe(false);
+  });
+
+  it('uses the title as the heading text (date + title)', () => {
+    const plan = Code.buildArticlePlan_([trackA], META);
+    const heading = plan.find((item) => item.kind === 'heading');
+    expect(heading.text).toBe('2026-11-13 曲A');
+  });
+});
+
+describe('article generation: generateArticle', () => {
+  const HEADER = ['file', 'title', 'description', 'instagram', 'suno', 'youtube',
+    'published_at', 'duration_sec', 'lyrics', 'sort', 'published'];
+  const TRACK_VALUES = [
+    HEADER,
+    ['a.mp3', '曲A', '説明A。', 'https://ig/a', 'https://suno/a', '', '2026-11-13', 100, '', 1, 'TRUE'],
+  ];
+  const META_VALUES = [
+    ['key', 'value'],
+    ['tags', '音楽、川口'],
+    ['suno_profile', 'https://suno.com/@freddiefujiwara'],
+    ['intro', '導入文。'],
+    ['outro', '締め。'],
+  ];
+
+  const makeSheet = (values) => ({ getDataRange: vi.fn(() => ({ getValues: () => values })) });
+  const makeParagraph = () => {
+    const p = {
+      heading: null,
+      runs: [],
+      setHeading: vi.fn((h) => { p.heading = h; return p; }),
+      appendText: vi.fn((t) => {
+        const run = {
+          text: t,
+          linkUrl: null,
+          setLinkUrl: vi.fn((u) => { run.linkUrl = u; return run; }),
+        };
+        p.runs.push(run);
+        return run;
+      }),
+    };
+    return p;
+  };
+  const makeBody = () => {
+    const body = {
+      paragraphs: [makeParagraph()],
+      clear: vi.fn(() => { body.paragraphs = [makeParagraph()]; }),
+      getParagraphs: vi.fn(() => body.paragraphs),
+      appendParagraph: vi.fn(() => {
+        const p = makeParagraph();
+        body.paragraphs.push(p);
+        return p;
+      }),
+    };
+    return body;
+  };
+
+  const wireArticle = ({ trackValues = TRACK_VALUES, metaValues = META_VALUES } = {}) => {
+    mockProperties.getProperty.mockImplementation((key) => {
+      if (key === Code.MUSIC_DB_ID_PROPERTY_KEY) return 'db-id';
+      if (key === Code.ARTICLE_DOC_ID_PROPERTY_KEY) return 'doc-id';
+      if (key === Code.CACHE_FOLDER_PROPERTY_KEY) return 'music-cache-test';
+      return null;
+    });
+    const sheets = { tracks: makeSheet(trackValues), meta: makeSheet(metaValues) };
+    global.SpreadsheetApp.openById.mockReturnValue({
+      getSheetByName: (name) => sheets[name] || null,
+    });
+    const body = makeBody();
+    global.DocumentApp.openById.mockReturnValue({ getBody: () => body });
+    return { body, sheets };
+  };
+
+  it('fails loudly when MUSIC_DB_ID is not set', () => {
+    mockProperties.getProperty.mockReturnValue(null);
+    expect(() => Code.generateArticle()).toThrow('script property MUSIC_DB_ID is not set');
+    expect(global.SpreadsheetApp.openById).not.toHaveBeenCalled();
+    expect(global.DocumentApp.openById).not.toHaveBeenCalled();
+  });
+
+  it('fails loudly when ARTICLE_DOC_ID is not set', () => {
+    mockProperties.getProperty.mockImplementation((key) => (
+      key === Code.MUSIC_DB_ID_PROPERTY_KEY ? 'db-id' : null));
+    expect(() => Code.generateArticle()).toThrow('script property ARTICLE_DOC_ID is not set');
+    expect(global.SpreadsheetApp.openById).not.toHaveBeenCalled();
+  });
+
+  it('fails when the tracks sheet is missing', () => {
+    wireArticle();
+    global.SpreadsheetApp.openById.mockReturnValue({ getSheetByName: () => null });
+    expect(() => Code.generateArticle()).toThrow('music-db has no "tracks" sheet');
+  });
+
+  it('refuses to regenerate when no track is published', () => {
+    wireArticle({ trackValues: [HEADER] });
+    expect(() => Code.generateArticle()).toThrow('no published tracks found in music-db');
+    expect(global.DocumentApp.openById).not.toHaveBeenCalled();
+  });
+
+  it('rewrites the target document from the sheet', () => {
+    const { body } = wireArticle();
+    const written = Code.generateArticle();
+    expect(global.SpreadsheetApp.openById).toHaveBeenCalledWith('db-id');
+    expect(global.DocumentApp.openById).toHaveBeenCalledWith('doc-id');
+    // One body paragraph per plan item: the paragraph left by
+    // clear() is reused for the first item, not left over.
+    expect(body.paragraphs).toHaveLength(written);
+    const texts = body.paragraphs.map((p) => p.runs.map((r) => r.text).join(''));
+    expect(texts[0]).toBe('[[タグ：音楽、川口]]');
+    expect(texts).toContain('[[音楽|曲A|a.mp3]]');
+    expect(texts).toContain('[[目次]]');
+    expect(texts[texts.length - 1]).toBe('締め。');
+    const heading = body.paragraphs.find((p) => p.heading);
+    expect(heading.runs[0].text).toBe('2026-11-13 曲A');
+    expect(heading.heading).toBe('HEADING2');
+    const ig = body.paragraphs.find((p) => p.runs.some((r) => r.text === Code.INSTAGRAM_LINK_LABEL));
+    expect(ig.runs[0].linkUrl).toBe('https://ig/a');
+  });
+});
+
+describe('manifest', () => {
+  it('grants the spreadsheet/document scopes and keeps anonymous web app access', () => {
+    const manifest = JSON.parse(readFileSync(new URL('../appsscript.json', import.meta.url), 'utf8'));
+    expect(manifest.oauthScopes).toContain('https://www.googleapis.com/auth/spreadsheets.readonly');
+    expect(manifest.oauthScopes).toContain('https://www.googleapis.com/auth/documents');
+    expect(manifest.webapp.access).toBe('ANYONE_ANONYMOUS');
   });
 });
