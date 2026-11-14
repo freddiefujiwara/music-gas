@@ -1155,13 +1155,34 @@ export const archiveMetaHeaders_ = (track) => {
 export const syncArchiveMeta_ = (track) => {
   const keys = archiveKeys_();
   if (!keys) return { status: 'skipped_not_configured' };
-  const meta = archiveMetaValues_(track);
-  const patch = ['title', 'creator', 'description', 'subject']
-    .map((key) => ({ op: 'addreplace', path: `/${key}`, value: meta[key] }));
+  const identifier = archiveIdentifier_(track.file);
+  const desired = archiveMetaValues_(track);
+  let current = {};
+  try {
+    const read = UrlFetchApp.fetch(
+      `${ARCHIVE_METADATA_BASE_URL}/${encodeURIComponent(identifier)}`,
+      { muteHttpExceptions: true },
+    );
+    if (read.getResponseCode() === 200) {
+      current = (JSON.parse(read.getContentText()) || {}).metadata || {};
+    }
+  } catch (e) {
+    current = {};
+  }
+  const patch = [];
+  ['title', 'creator', 'description', 'subject'].forEach((key) => {
+    if (JSON.stringify(current[key]) === JSON.stringify(desired[key])) return;
+    patch.push({
+      op: current[key] === undefined ? 'add' : 'replace',
+      path: `/${key}`,
+      value: desired[key],
+    });
+  });
+  if (!patch.length) return { status: 'ok' };
   let res;
   try {
     res = UrlFetchApp.fetch(
-      `${ARCHIVE_METADATA_BASE_URL}/${encodeURIComponent(archiveIdentifier_(track.file))}`,
+      `${ARCHIVE_METADATA_BASE_URL}/${encodeURIComponent(identifier)}`,
       {
         method: 'post',
         contentType: 'application/x-www-form-urlencoded',
@@ -1173,10 +1194,6 @@ export const syncArchiveMeta_ = (track) => {
   } catch (e) {
     return { status: 'error', error: `archive meta sync failed: ${e.message}` };
   }
-  const code = res.getResponseCode();
-  if (code < 200 || code >= 300) {
-    return { status: 'error', error: `archive meta sync failed: HTTP ${code}` };
-  }
   let parsed = null;
   try {
     parsed = JSON.parse(res.getContentText());
@@ -1185,6 +1202,10 @@ export const syncArchiveMeta_ = (track) => {
   }
   if (parsed && parsed.error) {
     return { status: 'error', error: `archive meta sync failed: ${parsed.error}` };
+  }
+  const code = res.getResponseCode();
+  if (code < 200 || code >= 300) {
+    return { status: 'error', error: `archive meta sync failed: HTTP ${code}` };
   }
   return { status: 'ok' };
 };
