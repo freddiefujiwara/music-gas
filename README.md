@@ -8,6 +8,7 @@ MP3 の保管は Google Drive です。Drive の直リンクは `Content-Disposi
 
 - `GET ?track=<ファイル名>` → `{ ok: true, track, mime, data }`（data は base64）
 - `GET ?o=list` → `{ ok: true, tracks: [...] }`（公開曲のファイル名一覧）
+- `GET ?o=rss` → music-db を正本とするポッドキャスト RSS フィード（XML）
 - エラー時 → `{ ok: false, error }`
 
 ## 設定
@@ -28,6 +29,10 @@ MP3 の保管は Google Drive です。Drive の直リンクは `Content-Disposi
 - `ARTICLE_DOC_ID` — 生成先ドキュメントの ID（**このドキュメントだけ**が書き換わります。ステージングでは必ず使い捨てコピーの ID を指定してください）
 
 スコープ追加（スプレッドシート読み取り・ドキュメント書き込み）のため、マージ後はエディタで `generateArticle()` を一度実行して再認可してください。公開曲が1曲も無い場合は、記事を消してしまわないようエラーで止まります。
+
+## ポッドキャスト RSS
+
+`GET ?o=rss` は、music-db の `tracks` タブで公開フラグが TRUE の曲だけを、新しい順に配信します。各エピソードの音声 URL はファイル名から導出します（`https://archive.org/download/freddiefujiwara-<スラッグ>/<ファイル名>`）。Drive フォルダのスキャンに存在しない曲は出しません。`MUSIC_DB_ID` が未設定の場合やシートを読めない場合は、購読を壊さないよう item の無い channel だけのフィードを返します。
 
 ## デプロイ
 

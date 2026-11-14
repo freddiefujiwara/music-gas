@@ -38,6 +38,7 @@
  *  API:
  *    GET ?track=<file name>  -> { ok, track, mime, data(base64) }
  *    GET ?o=list             -> { ok, tracks: [file names] }
+ *    GET ?o=rss              -> podcast RSS feed built from music-db
  *  Errors are JSON too: { ok: false, error }.
  *
  *  Editor helper:
@@ -205,6 +206,8 @@ export const serveTrack_ = (track, file) => {
 
 export const doGet = (e) => {
   const { track, o: output } = (e && e.parameter) || {};
+  if (output === 'rss') return serveRss_();
+
   const tracks = getTracks_();
   if (!tracks) return json_({ ok: false, error: 'tracks are not configured' });
 
@@ -306,6 +309,12 @@ export const cellSort_ = (value) => {
   return Number.isFinite(n) ? n : Number.MAX_SAFE_INTEGER;
 };
 
+/** Durations are whole, non-negative seconds; anything else is zero. */
+export const cellDuration_ = (value) => {
+  const n = typeof value === 'number' ? value : Number(cellText_(value));
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
+};
+
 /**
  * Parses the "tracks" sheet values (header row + data rows)
  * into track objects, keeping only published rows and
@@ -334,6 +343,7 @@ export const parseTracksSheet_ = (values) => {
       suno: cellText_(col(row, 'suno')),
       youtube: cellText_(col(row, 'youtube')),
       publishedAt: cellDate_(col(row, 'published_at')),
+      durationSec: cellDuration_(col(row, 'duration_sec')),
       lyrics: cellText_(col(row, 'lyrics')),
       sort: cellSort_(col(row, 'sort')),
       published: cellBool_(col(row, 'published')),
@@ -475,6 +485,155 @@ export const readMusicDb_ = (spreadsheet) => {
   };
 };
 
+/** -----------------------------
+ *  Podcast RSS feed from the music-db spreadsheet.
+ *
+ *  The spreadsheet supplies the episode metadata and the
+ *  existing Drive folder scan supplies each MP3's byte size.
+ *  A row becomes an episode only when it is published in the
+ *  sheet and the same file name is present in the scan. The
+ *  Internet Archive URL is derived from the file name: the
+ *  item identifier is "freddiefujiwara-<slug>".
+ *
+ *  Feed readers drop items without a <link>, so the Suno URL
+ *  is mandatory here. If the spreadsheet cannot be read (or
+ *  MUSIC_DB_ID is not configured), subscribers still receive
+ *  a valid channel-only feed rather than an exception page.
+ *  ----------------------------- */
+export const RSS_CHANNEL_TITLE = '川口の歌';
+export const RSS_CHANNEL_LINK = 'https://freddiefujiwara.com/blog/1V7cXplHKbsT48EhLarl-SPHfDV-lSEafEId2OMgExkg';
+export const RSS_CHANNEL_DESCRIPTION = 'Sunoで作った川口の歌の配信フィード';
+export const RSS_CHANNEL_LANGUAGE = 'ja';
+export const RSS_ITUNES_AUTHOR = '藤原史和';
+export const ARCHIVE_DOWNLOAD_BASE_URL = 'https://archive.org/download';
+export const ARCHIVE_IDENTIFIER_PREFIX = 'freddiefujiwara-';
+const RSS_WEEKDAYS_ = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const RSS_MONTHS_ = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+export const escapeXml_ = (value) => String(value == null ? '' : value)
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;')
+  .replace(/'/g, '&apos;');
+
+/**
+ * Formats a yyyy-MM-dd date as midnight Asia/Tokyo in
+ * RFC-822 form, e.g. "Sat, 07 Nov 2026 00:00:00 +0900".
+ */
+export const formatRssDate_ = (value) => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(cellDate_(value));
+  if (!match) return '';
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1
+    || date.getUTCDate() !== day) return '';
+  return `${RSS_WEEKDAYS_[date.getUTCDay()]}, ${match[3]} `
+    + `${RSS_MONTHS_[month - 1]} ${match[1]} 00:00:00 +0900`;
+};
+
+/** Formats a duration in seconds as M:SS. */
+export const formatDuration_ = (value) => {
+  const seconds = cellDuration_(value);
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+};
+
+export const archiveUrl_ = (file) => {
+  const name = cellText_(file);
+  const slug = name.replace(/\.mp3$/i, '');
+  const identifier = `${ARCHIVE_IDENTIFIER_PREFIX}${slug}`;
+  return `${ARCHIVE_DOWNLOAD_BASE_URL}/${encodeURIComponent(identifier)}`
+    + `/${encodeURIComponent(name)}`;
+};
+
+/**
+ * Builds the complete RSS document. `fileSizes` maps file
+ * names to the byte sizes found by the Drive folder scan;
+ * tracks absent from that map are not published as episodes.
+ */
+export const buildRssFeed_ = (tracks, fileSizes = {}) => {
+  const sizes = fileSizes && typeof fileSizes === 'object' ? fileSizes : {};
+  const episodes = (Array.isArray(tracks) ? tracks : [])
+    .filter((track) => track && track.published !== false && track.file && track.suno
+      && Object.prototype.hasOwnProperty.call(sizes, track.file)
+      && Number.isFinite(sizes[track.file]) && sizes[track.file] >= 0
+      && formatRssDate_(track.publishedAt))
+    .sort((a, b) => {
+      const byDate = cellDate_(b.publishedAt).localeCompare(cellDate_(a.publishedAt));
+      return byDate || cellSort_(a.sort) - cellSort_(b.sort);
+    });
+
+  const lines = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">',
+    '  <channel>',
+    `    <title>${escapeXml_(RSS_CHANNEL_TITLE)}</title>`,
+    `    <link>${escapeXml_(RSS_CHANNEL_LINK)}</link>`,
+    `    <description>${escapeXml_(RSS_CHANNEL_DESCRIPTION)}</description>`,
+    `    <language>${escapeXml_(RSS_CHANNEL_LANGUAGE)}</language>`,
+    `    <itunes:author>${escapeXml_(RSS_ITUNES_AUTHOR)}</itunes:author>`,
+  ];
+
+  episodes.forEach((track) => {
+    lines.push(
+      '    <item>',
+      `      <title>${escapeXml_(track.title)}</title>`,
+      `      <link>${escapeXml_(track.suno)}</link>`,
+      `      <guid isPermaLink="false">${escapeXml_(track.file)}</guid>`,
+      `      <pubDate>${formatRssDate_(track.publishedAt)}</pubDate>`,
+      `      <description>${escapeXml_(track.description)}</description>`,
+      `      <enclosure url="${escapeXml_(archiveUrl_(track.file))}" `
+        + `length="${sizes[track.file]}" type="audio/mpeg"/>`,
+      `      <itunes:duration>${formatDuration_(track.durationSec)}</itunes:duration>`,
+      '    </item>',
+    );
+  });
+
+  lines.push('  </channel>', '</rss>');
+  return lines.join('\n');
+};
+
+/**
+ * Reads the published sheet rows and pairs them with the
+ * Drive scan's file sizes. Every failure mode deliberately
+ * degrades to a channel-only feed instead of throwing.
+ */
+export const serveRss_ = () => {
+  let tracks = [];
+  try {
+    const dbId = PropertiesService.getScriptProperties()
+      .getProperty(MUSIC_DB_ID_PROPERTY_KEY);
+    if (dbId && String(dbId).trim()) {
+      tracks = readMusicDb_(SpreadsheetApp.openById(String(dbId).trim())).tracks;
+    }
+  } catch (e) {
+    tracks = [];
+  }
+
+  const fileSizes = {};
+  if (tracks.length) {
+    let scanned = null;
+    try {
+      scanned = getTracks_();
+    } catch (e) { /* an unavailable scan means no episodes */ }
+    if (scanned) {
+      tracks.forEach((track) => {
+        const fileId = scanned[track.file];
+        if (!fileId) return;
+        try {
+          const size = DriveApp.getFileById(fileId).getSize();
+          if (Number.isFinite(size) && size >= 0) fileSizes[track.file] = size;
+        } catch (e) { /* skip tracks whose Drive file cannot be read */ }
+      });
+    }
+  }
+
+  return xml_(buildRssFeed_(tracks, fileSizes));
+};
+
 /**
  * Regenerates the roundup article document from music-db
  * (run from the editor; no trigger needed). Only the document
@@ -496,3 +655,7 @@ export const generateArticle = () => {
 export const json_ = (obj) => ContentService
   .createTextOutput(JSON.stringify(obj))
   .setMimeType(ContentService.MimeType.JSON);
+
+export const xml_ = (text) => ContentService
+  .createTextOutput(text)
+  .setMimeType(ContentService.MimeType.XML);
