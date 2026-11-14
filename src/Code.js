@@ -1110,6 +1110,17 @@ export const archiveKeys_ = () => {
   return { access: String(access).trim(), secret: String(secret).trim() };
 };
 
+/** The IA item metadata for one track, as the sheet defines it. */
+export const archiveMetaValues_ = (track) => {
+  const title = (track && track.title) || '';
+  return {
+    title,
+    creator: RSS_ITUNES_AUTHOR,
+    description: `Sunoで作った川口の歌「${title}」です。`,
+    subject: ['川口', 'Suno', 'music'],
+  };
+};
+
 /**
  * The x-archive-meta-* headers for one track's item. The
  * values go in raw (UTF-8), never percent-encoded: IA stores
@@ -1120,15 +1131,62 @@ export const archiveKeys_ = () => {
  * descriptions).
  */
 export const archiveMetaHeaders_ = (track) => {
-  const title = (track && track.title) || '';
+  const meta = archiveMetaValues_(track);
   return {
     'x-archive-meta-mediatype': 'audio',
     'x-archive-meta-collection': ARCHIVE_COLLECTION,
-    'x-archive-meta-title': title,
-    'x-archive-meta-creator': RSS_ITUNES_AUTHOR,
-    'x-archive-meta-description': `Sunoで作った川口の歌「${title}」です。`,
-    'x-archive-meta-subject': '川口;Suno;music',
+    'x-archive-meta-title': meta.title,
+    'x-archive-meta-creator': meta.creator,
+    'x-archive-meta-description': meta.description,
+    'x-archive-meta-subject': meta.subject.join(';'),
   };
+};
+
+/**
+ * Rewrites an existing item's metadata through the Metadata
+ * Write API (a JSON Patch against the "metadata" target).
+ * The S3 headers only apply when an item is created — a
+ * re-PUT of the file leaves the stored metadata untouched —
+ * so publishing always syncs the metadata explicitly. That
+ * is also what repairs items whose metadata is wrong (the
+ * 2026-11-15 mojibake above). Returns a step result like
+ * uploadToArchive_ does.
+ */
+export const syncArchiveMeta_ = (track) => {
+  const keys = archiveKeys_();
+  if (!keys) return { status: 'skipped_not_configured' };
+  const meta = archiveMetaValues_(track);
+  const patch = ['title', 'creator', 'description', 'subject']
+    .map((key) => ({ op: 'addreplace', path: `/${key}`, value: meta[key] }));
+  let res;
+  try {
+    res = UrlFetchApp.fetch(
+      `${ARCHIVE_METADATA_BASE_URL}/${encodeURIComponent(archiveIdentifier_(track.file))}`,
+      {
+        method: 'post',
+        contentType: 'application/x-www-form-urlencoded',
+        payload: `-target=metadata&-patch=${encodeURIComponent(JSON.stringify(patch))}`,
+        headers: { Authorization: `LOW ${keys.access}:${keys.secret}` },
+        muteHttpExceptions: true,
+      },
+    );
+  } catch (e) {
+    return { status: 'error', error: `archive meta sync failed: ${e.message}` };
+  }
+  const code = res.getResponseCode();
+  if (code < 200 || code >= 300) {
+    return { status: 'error', error: `archive meta sync failed: HTTP ${code}` };
+  }
+  let parsed = null;
+  try {
+    parsed = JSON.parse(res.getContentText());
+  } catch (e) {
+    parsed = null;
+  }
+  if (parsed && parsed.error) {
+    return { status: 'error', error: `archive meta sync failed: ${parsed.error}` };
+  }
+  return { status: 'ok' };
 };
 
 /**
@@ -1194,9 +1252,10 @@ export const uploadToArchive_ = (track, driveFile) => {
 /** -----------------------------
  *  Publish / unpublish.
  *
- *  Publishing is three idempotent steps run in order — flip
+ *  Publishing is four idempotent steps run in order — flip
  *  the sheet row to published, upload the MP3 to Internet
- *  Archive, regenerate the article — and the result reports
+ *  Archive, sync the item's metadata, regenerate the
+ *  article — and the result reports
  *  each step separately. Nothing is rolled back: every step
  *  can simply be re-run, which the admin's retry does. The
  *  pre-checks run before anything changes: the sheet is the
@@ -1224,6 +1283,9 @@ export const publishTrack_ = (spreadsheet, row, file) => {
   const archive = uploadToArchive_(track, DriveApp.getFileById(scanned[track.file]));
   steps.archive = archive.status === 'error'
     ? `error: ${archive.error}` : archive.status;
+  const metaSync = syncArchiveMeta_(track);
+  steps.archive_meta = metaSync.status === 'error'
+    ? `error: ${metaSync.error}` : metaSync.status;
   try {
     generateArticle();
     steps.article = 'ok';

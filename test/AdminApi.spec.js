@@ -591,6 +591,49 @@ describe('Internet Archive', () => {
       .toEqual({ status: 'accepted' });
   });
 
+  it('syncArchiveMeta_ posts a JSON patch with the raw values', () => {
+    props.IA_ACCESS_KEY = 'access-key';
+    props.IA_SECRET_KEY = 'secret-key';
+    const calls = [];
+    fetchHandler = (url, opts) => {
+      calls.push({ url, opts });
+      return {
+        getResponseCode: () => 200,
+        getContentText: () => JSON.stringify({ success: true }),
+      };
+    };
+    const track = { file: 'a.mp3', title: '曲A' };
+    expect(Code.syncArchiveMeta_(track)).toEqual({ status: 'ok' });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe('https://archive.org/metadata/freddiefujiwara-a');
+    expect(calls[0].opts.method).toBe('post');
+    expect(calls[0].opts.headers.Authorization).toBe('LOW access-key:secret-key');
+    const form = new URLSearchParams(calls[0].opts.payload);
+    expect(form.get('-target')).toBe('metadata');
+    expect(JSON.parse(form.get('-patch'))).toEqual([
+      { op: 'addreplace', path: '/title', value: '曲A' },
+      { op: 'addreplace', path: '/creator', value: '藤原史和' },
+      { op: 'addreplace', path: '/description', value: 'Sunoで作った川口の歌「曲A」です。' },
+      { op: 'addreplace', path: '/subject', value: ['川口', 'Suno', 'music'] },
+    ]);
+  });
+
+  it('syncArchiveMeta_ skips without keys and reports errors', () => {
+    const track = { file: 'a.mp3', title: '曲A' };
+    expect(Code.syncArchiveMeta_(track)).toEqual({ status: 'skipped_not_configured' });
+    props.IA_ACCESS_KEY = 'access-key';
+    props.IA_SECRET_KEY = 'secret-key';
+    fetchHandler = () => ({ getResponseCode: () => 500, getContentText: () => '' });
+    expect(Code.syncArchiveMeta_(track))
+      .toEqual({ status: 'error', error: 'archive meta sync failed: HTTP 500' });
+    fetchHandler = () => ({
+      getResponseCode: () => 200,
+      getContentText: () => JSON.stringify({ error: 'bad patch' }),
+    });
+    expect(Code.syncArchiveMeta_(track))
+      .toEqual({ status: 'error', error: 'archive meta sync failed: bad patch' });
+  });
+
   it('check_archive action answers through doPost', () => {
     const token = signIn();
     fetchHandler = (url) => {
@@ -647,7 +690,10 @@ describe('publish / unpublish', () => {
     }));
     expect(res.ok).toBe(true);
     expect(res.file).toBe('b.mp3');
-    expect(res.steps).toEqual({ sheet: 'ok', archive: 'skipped_not_configured', article: 'ok' });
+    expect(res.steps).toEqual({
+      sheet: 'ok', archive: 'skipped_not_configured',
+      archive_meta: 'skipped_not_configured', article: 'ok',
+    });
     expect(sheets.tracks.state.rows[2][10]).toBe(true);
   });
 
@@ -675,6 +721,7 @@ describe('publish / unpublish', () => {
       action: 'publish_track', session_token: token, row: 2, file: 'b.mp3',
     }));
     expect(res.steps.archive).toBe('ok');
+    expect(res.steps.archive_meta).toBe('ok');
   });
 
   it('publish refuses when a required field or the MP3 is missing', () => {
