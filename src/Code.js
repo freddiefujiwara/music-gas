@@ -708,9 +708,19 @@ export const generateArticle = () => {
  *
  *  Actions:
  *    exchange_session / revoke_session / issue_share / revoke_share
+ *    issue_claude_key / revoke_claude_key / claude_key_status
  *    list_tracks / create_track / update_track / delete_track
  *    update_meta / upload_mp3 / publish_track / unpublish_track
  *    regenerate_article / check_archive
+ *
+ *  The owner can also mint a 30-day API key for Muse (stored
+ *  hashed in the claude_keys sheet, single active key: issuing
+ *  revokes the previous one, and the plaintext is returned
+ *  exactly once, at issue time). A request body carrying a
+ *  live `claude_key` is owner-equivalent for the data actions
+ *  above, so the new-song flow can run end to end from a
+ *  script; the key never authenticates the session actions
+ *  themselves (exchange / revoke / issue / share management).
  *  Every mutation runs under the script lock and drops the
  *  scanned track map cache, so the public player and RSS feed
  *  read the new state on their next request.
@@ -719,6 +729,8 @@ export const GOOGLE_OAUTH_CLIENT_ID_PROPERTY_KEY = 'GOOGLE_OAUTH_CLIENT_ID';
 export const AVAILABLE_GMAILS_PROPERTY_KEY = 'AVAILABLE_GMAILS';
 export const OWNER_SESSIONS_SHEET_NAME = 'owner_sessions';
 export const SHARE_SESSIONS_SHEET_NAME = 'share_sessions';
+export const CLAUDE_KEYS_SHEET_NAME = 'claude_keys';
+export const CLAUDE_KEY_PREFIX = 'mk_';
 export const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 export const SESSION_SHEET_HEADERS = [
   'token_hash', 'issued_at', 'expires_at', 'revoked_at',
@@ -839,6 +851,57 @@ export const issueShareSession_ = () => issueSession_(
 export const revokeShareSession_ = () => {
   revokeActiveSessions_(SHARE_SESSIONS_SHEET_NAME, new Date().toISOString());
   return { revoked: true };
+};
+
+/**
+ * Muse API keys live in their own sheet but reuse the
+ * session row shape and the 30-day TTL. Unlike owner
+ * sessions there is exactly one live key: issuing a new
+ * one revokes the previous key, like the share link. The
+ * plaintext key is returned only by this issue call.
+ */
+export const issueClaudeKey_ = () => {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const expiresIso = new Date(now.getTime() + SESSION_TTL_SECONDS * 1000).toISOString();
+  revokeActiveSessions_(CLAUDE_KEYS_SHEET_NAME, nowIso);
+  const key = CLAUDE_KEY_PREFIX
+    + (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
+  getSessionSheet_(CLAUDE_KEYS_SHEET_NAME)
+    .appendRow([hashSessionToken_(key), nowIso, expiresIso, '', 0, '']);
+  return {
+    claude_key: key,
+    issued_at: nowIso,
+    expires_at: expiresIso,
+    ttl_seconds: SESSION_TTL_SECONDS,
+  };
+};
+
+export const revokeClaudeKey_ = () => {
+  revokeActiveSessions_(CLAUDE_KEYS_SHEET_NAME, new Date().toISOString());
+  return { revoked: true };
+};
+
+export const validateClaudeKey_ = (key) => validateSessionToken_(
+  CLAUDE_KEYS_SHEET_NAME, key,
+);
+
+/** Reports the live key's window without ever returning it. */
+export const claudeKeyStatus_ = () => {
+  const { values } = readSessionRows_(CLAUDE_KEYS_SHEET_NAME);
+  const nowIso = new Date().toISOString();
+  for (let index = 1; index < values.length; index += 1) {
+    const row = values[index];
+    if (sessionCellIso_(row[3])) continue;
+    const expiresAt = sessionCellIso_(row[2]);
+    if (!expiresAt || expiresAt <= nowIso) continue;
+    return {
+      active: true,
+      issued_at: sessionCellIso_(row[1]),
+      expires_at: expiresAt,
+    };
+  }
+  return { active: false };
 };
 
 export const validateSessionToken_ = (name, token) => {
@@ -1279,18 +1342,26 @@ export const doPost = (e) => {
     }
   }
 
-  // Issuing and revoking access links requires owner proof (the
-  // Google ID token, or the owner session from it); a share
-  // token cannot mint more share tokens.
-  if (body.action === 'issue_share' || body.action === 'revoke_share') {
+  // Issuing and revoking access links and Muse API keys
+  // requires owner proof (the Google ID token, or the owner
+  // session from it); neither a share token nor a Muse key
+  // can mint more credentials.
+  if (body.action === 'issue_share' || body.action === 'revoke_share'
+    || body.action === 'issue_claude_key' || body.action === 'revoke_claude_key'
+    || body.action === 'claude_key_status') {
     try {
       requireOwnerAuth_(body);
     } catch (err) {
       return authError_(err);
     }
     try {
-      const result = withScriptLock_(() => (body.action === 'issue_share'
-        ? issueShareSession_() : revokeShareSession_()));
+      const result = withScriptLock_(() => {
+        if (body.action === 'issue_share') return issueShareSession_();
+        if (body.action === 'revoke_share') return revokeShareSession_();
+        if (body.action === 'issue_claude_key') return issueClaudeKey_();
+        if (body.action === 'revoke_claude_key') return revokeClaudeKey_();
+        return claudeKeyStatus_();
+      });
       return json_({ ok: true, ...result });
     } catch (err) {
       return json_({ ok: false, error: err.message });
@@ -1298,8 +1369,9 @@ export const doPost = (e) => {
   }
 
   // The remaining actions accept the owner's ID token, the
-  // owner session exchanged from it, or a share token from an
-  // issued access link (owner-equivalent).
+  // owner session exchanged from it, a share token from an
+  // issued access link (owner-equivalent), or a live Muse
+  // API key (also owner-equivalent).
   let shareSession = null;
   if (body.session_token) {
     let ownerSession = null;
@@ -1310,6 +1382,16 @@ export const doPost = (e) => {
     }
     if (!ownerSession) {
       return json_({ ok: false, status: 401, error: 'session expired or invalid' });
+    }
+  } else if (body.claude_key) {
+    let claudeKey = null;
+    try {
+      claudeKey = validateClaudeKey_(body.claude_key);
+    } catch (err) {
+      return json_({ ok: false, error: err.message });
+    }
+    if (!claudeKey) {
+      return json_({ ok: false, status: 401, error: 'claude key expired or invalid' });
     }
   } else if (body.share_token) {
     try {
