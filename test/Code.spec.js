@@ -558,7 +558,7 @@ describe('podcast RSS feed', () => {
     it('returns a channel-only feed when MUSIC_DB_ID is not set', () => {
       const output = Code.doGet({ parameter: { o: 'rss' } });
       expect(output.mimeType).toBe('text/xml');
-      expect(output.content).toContain('<title>川口の歌</title>');
+      expect(output.content).toContain(`<title>${Code.RSS_CHANNEL_TITLE}</title>`);
       expect(output.content).not.toContain('<item>');
       expect(global.SpreadsheetApp.openById).not.toHaveBeenCalled();
     });
@@ -570,7 +570,7 @@ describe('podcast RSS feed', () => {
         throw new Error('read failed');
       });
       const output = Code.doGet({ parameter: { o: 'rss' } });
-      expect(output.content).toContain('<title>川口の歌</title>');
+      expect(output.content).toContain(`<title>${Code.RSS_CHANNEL_TITLE}</title>`);
       expect(output.content).not.toContain('<item>');
     });
   });

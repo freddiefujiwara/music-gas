@@ -407,7 +407,7 @@ export const readMusicDb_ = (spreadsheet) => {
  *  MUSIC_DB_ID is not configured), subscribers still receive
  *  a valid channel-only feed rather than an exception page.
  *  ----------------------------- */
-export const RSS_CHANNEL_TITLE = '川口の歌';
+export const RSS_CHANNEL_TITLE = '藤原史和 | 川口を歩くQAエンジニア | 川口の歌';
 export const RSS_CHANNEL_LINK = 'https://freddiefujiwara.com/blog/1V7cXplHKbsT48EhLarl-SPHfDV-lSEafEId2OMgExkg';
 export const RSS_CHANNEL_DESCRIPTION = 'Sunoで作った川口の歌の配信フィード';
 export const RSS_CHANNEL_LANGUAGE = 'ja';
