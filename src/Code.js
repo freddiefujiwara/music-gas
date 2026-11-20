@@ -164,7 +164,39 @@ export const getRequiredProperty_ = (key) => {
   return String(value).trim();
 };
 
-export const cellText_ = (value) => (value == null ? '' : String(value).trim());
+/**
+ * The one text coercion every sheet / payload value passes
+ * through. A JSON payload can carry an object whose toString
+ * is not callable ({"toString": []}), which makes String()
+ * throw; such a value reads as empty instead of taking the
+ * whole parse (and the feed / article / admin action built on
+ * it) down with it.
+ */
+export const cellText_ = (value) => {
+  if (value == null) return '';
+  try {
+    return String(value).trim();
+  } catch (e) {
+    return '';
+  }
+};
+
+/**
+ * Numbers are taken only from number values and non-blank
+ * numeric strings. A bare Number() would fabricate values
+ * from other types (true -> 1, [65] -> 65, '' -> 0), so
+ * booleans, arrays, objects and blanks are not numbers here.
+ */
+export const cellNumber_ = (value) => {
+  if (typeof value === 'number') return value;
+  if (typeof value === 'string' && value.trim() !== '') return Number(value);
+  return NaN;
+};
+
+/** Removes unpaired surrogates, which encodeURIComponent rejects. */
+export const stripLoneSurrogates_ = (text) => String(text).replace(
+  /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '',
+);
 
 /**
  * Normalizes a published_at cell to "yyyy-MM-dd". Cells come
@@ -172,8 +204,15 @@ export const cellText_ = (value) => (value == null ? '' : String(value).trim());
  * Date objects (formatted in the project's time zone).
  */
 export const cellDate_ = (value) => {
-  if (value instanceof Date) return Utilities.formatDate(value, 'Asia/Tokyo', 'yyyy-MM-dd');
-  return cellText_(value).slice(0, 10);
+  if (value instanceof Date) {
+    // An invalid Date makes formatDate throw; it reads as absent.
+    if (Number.isNaN(value.getTime())) return '';
+    return Utilities.formatDate(value, 'Asia/Tokyo', 'yyyy-MM-dd');
+  }
+  // Slice by code point, not by UTF-16 unit, so an astral
+  // character straddling the cut is never split into a lone
+  // surrogate.
+  return [...cellText_(value)].slice(0, 10).join('');
 };
 
 export const cellBool_ = (value) => value === true
@@ -181,13 +220,13 @@ export const cellBool_ = (value) => value === true
 
 /** Sort keys that do not parse sort last instead of crashing. */
 export const cellSort_ = (value) => {
-  const n = typeof value === 'number' ? value : Number(cellText_(value));
+  const n = cellNumber_(value);
   return Number.isFinite(n) ? n : Number.MAX_SAFE_INTEGER;
 };
 
 /** Durations are whole, non-negative seconds; anything else is zero. */
 export const cellDuration_ = (value) => {
-  const n = typeof value === 'number' ? value : Number(cellText_(value));
+  const n = cellNumber_(value);
   return Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
 };
 
@@ -418,12 +457,20 @@ const RSS_WEEKDAYS_ = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const RSS_MONTHS_ = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
   'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
-export const escapeXml_ = (value) => String(value == null ? '' : value)
+export const escapeXml_ = (value) => {
+  let text;
+  try {
+    text = String(value == null ? '' : value);
+  } catch (e) {
+    text = '';
+  }
+  return text
   .replace(/&/g, '&amp;')
   .replace(/</g, '&lt;')
   .replace(/>/g, '&gt;')
   .replace(/"/g, '&quot;')
   .replace(/'/g, '&apos;');
+};
 
 /**
  * Formats a yyyy-MM-dd date as midnight Asia/Tokyo in
@@ -449,7 +496,7 @@ export const formatDuration_ = (value) => {
 };
 
 export const archiveUrl_ = (file) => {
-  const name = cellText_(file);
+  const name = stripLoneSurrogates_(cellText_(file));
   const slug = name.replace(/\.mp3$/i, '');
   const identifier = `${ARCHIVE_IDENTIFIER_PREFIX}${slug}`;
   return `${ARCHIVE_DOWNLOAD_BASE_URL}/${encodeURIComponent(identifier)}`
@@ -620,12 +667,13 @@ export const verifyIdToken_ = (idToken) => {
     throw new Error('invalid iss');
   }
   if (payload.aud !== clientId) throw new Error('invalid aud');
-  const exp = Number(payload.exp || 0);
+  const exp = cellNumber_(payload.exp);
   if (!exp || exp * 1000 <= Date.now()) throw new Error('token expired');
   if (payload.email_verified !== true && payload.email_verified !== 'true') {
     throw new Error('email not verified');
   }
-  const email = String(payload.email || '').toLowerCase();
+  const email = typeof payload.email === 'string'
+    ? payload.email.toLowerCase() : '';
   if (!email) throw new Error('missing email');
   if (!allowedEmails_().includes(email)) throw new Error('forbidden email');
   return email;
@@ -801,10 +849,12 @@ export const readTracksSheetAll_ = (spreadsheet) => {
 };
 
 export const resolveTrack_ = (tracks, row, file) => {
-  const n = Number(row);
-  if (!Number.isInteger(n) || n < 1) throw new Error(`invalid row: ${row}`);
+  const n = cellNumber_(row);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(`invalid row: ${cellText_(row)}`);
+  }
   const track = tracks.find((t) => t.row === n);
-  if (!track) throw new Error(`track row not found: ${row}`);
+  if (!track) throw new Error(`track row not found: ${cellText_(row)}`);
   const expected = cellText_(file);
   if (expected && track.file !== expected) {
     throw new Error(`track file mismatch: row ${n} is ${track.file}, not ${expected}`);
@@ -821,7 +871,7 @@ export const resolveTrack_ = (tracks, row, file) => {
  */
 export const trackRowCells_ = (track, headers) => {
   const src = track || {};
-  const sort = Number(src.sort);
+  const sort = cellNumber_(src.sort);
   return headers.map((header) => {
     switch (header) {
       case 'published_at': return cellDate_(src.published_at ?? src.publishedAt);
@@ -958,7 +1008,7 @@ export const ARCHIVE_METADATA_BASE_URL = 'https://archive.org/metadata';
 export const ARCHIVE_COLLECTION = 'opensource_audio';
 
 export const archiveIdentifier_ = (file) => `${ARCHIVE_IDENTIFIER_PREFIX}${
-  cellText_(file).replace(/\.mp3$/i, '')}`;
+  stripLoneSurrogates_(cellText_(file)).replace(/\.mp3$/i, '')}`;
 
 export const archiveKeys_ = () => {
   const access = getScriptProperty_(IA_ACCESS_KEY_PROPERTY_KEY);
@@ -1084,7 +1134,9 @@ export const checkArchive_ = (file) => {
     if (res.getResponseCode() !== 200) return { exists: false };
     const files = (JSON.parse(res.getContentText()) || {}).files || [];
     const hit = files.find((f) => f && f.name === name);
-    return hit ? { exists: true, size: Number(hit.size) || 0 } : { exists: false };
+    if (!hit) return { exists: false };
+    const size = cellNumber_(hit.size);
+    return { exists: true, size: Number.isFinite(size) && size >= 0 ? size : 0 };
   } catch (e) {
     return { exists: false };
   }
