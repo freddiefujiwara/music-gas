@@ -205,6 +205,16 @@ describe('unstringifiable cell values (toString is not callable)', () => {
     expect(Code.escapeXml_(evil)).toBe('');
   });
 
+  it('an invalid Date cell reads as absent instead of throwing', () => {
+    expect(() => Code.cellDate_(new Date(NaN))).not.toThrow();
+    expect(Code.cellDate_(new Date(NaN))).toBe('');
+    const tracks = Code.parseTracksSheetAll_([
+      HEADER,
+      row({ published_at: new Date(NaN) }),
+    ]);
+    expect(tracks[0].publishedAt).toBe('');
+  });
+
   it('the date and duration coercions survive unstringifiable cells', () => {
     expect(Code.cellDate_(evil)).toBe('');
     expect(Code.formatRssDate_(evil)).toBe('');

@@ -204,7 +204,11 @@ export const stripLoneSurrogates_ = (text) => String(text).replace(
  * Date objects (formatted in the project's time zone).
  */
 export const cellDate_ = (value) => {
-  if (value instanceof Date) return Utilities.formatDate(value, 'Asia/Tokyo', 'yyyy-MM-dd');
+  if (value instanceof Date) {
+    // An invalid Date makes formatDate throw; it reads as absent.
+    if (Number.isNaN(value.getTime())) return '';
+    return Utilities.formatDate(value, 'Asia/Tokyo', 'yyyy-MM-dd');
+  }
   // Slice by code point, not by UTF-16 unit, so an astral
   // character straddling the cut is never split into a lone
   // surrogate.
