@@ -266,11 +266,12 @@ describe('article generation: paragraph plan', () => {
       'link:▶️Suno で曲を聴く->https://suno/b',
       'E',
       'E',
-      'text:[[歌詞]]',
+      'text:```',
       'text:歌詞B1行目',
       'text:歌詞B2行目',
       'E',
       'text:歌詞B3行目',
+      'text:```',
       'text:締めの一文。',
     ]);
   });
@@ -299,7 +300,7 @@ describe('article generation: paragraph plan', () => {
 
   it('omits the lyrics block entirely when a track has no lyrics', () => {
     const plan = Code.buildArticlePlan_([trackA], META);
-    expect(plan.some((item) => item.text === '[[歌詞]]')).toBe(false);
+    expect(plan.some((item) => item.text === '```')).toBe(false);
   });
 
   it('uses the title as the heading text (date + title)', () => {
