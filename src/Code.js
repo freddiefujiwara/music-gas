@@ -321,8 +321,8 @@ export const splitBlocks_ = (text) => String(text || '')
  *   [[タグ：…]] / intro blocks with the Suno profile link-card
  *   paragraph after the second block / one [[音楽|title|file]]
  *   marker per track / [[目次]] / per track: "date title"
- *   heading, description blocks, label links, [[歌詞]] and the
- *   lyric lines / outro paragraphs.
+ *   heading, description blocks, label links, the lyric lines
+ *   wrapped in ``` fences / outro paragraphs.
  *
  *  Section headings use the track title as-is (the title is
  *  canonical; older hand-written heading variants are not
@@ -379,11 +379,12 @@ export const buildArticlePlan_ = (tracks, meta) => {
     empty();
     const lyrics = String(track.lyrics || '').replace(/\s+$/, '');
     if (lyrics) {
-      text('[[歌詞]]');
+      text('```');
       lyrics.split('\n').forEach((line) => {
         if (line.trim()) text(line);
         else empty();
       });
+      text('```');
     }
   });
 
