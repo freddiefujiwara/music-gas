@@ -836,10 +836,6 @@ export const invalidateTracksCache_ = () => {
  *  cannot rewrite or delete the wrong row after the sheet
  *  changed underneath it.
  *  ----------------------------- */
-export const TRACK_SHEET_COLUMNS = [
-  'file', 'title', 'description', 'instagram', 'suno', 'youtube',
-  'published_at', 'duration_sec', 'lyrics', 'sort', 'published',
-];
 export const META_KEYS = ['tags', 'suno_profile', 'podcast_feed', 'intro', 'outro'];
 
 export const readTracksSheetAll_ = (spreadsheet) => {
